@@ -11,7 +11,7 @@
 
 📖 **[Full design article (WeChat, in Chinese)](https://mp.weixin.qq.com/s/nibHYWmDTf6TkNhPhtvFdw)** — the Nüwa Test, the three-capability foundation, 18 iterations, emergence, and the taggant proposal.
 
-**English** | [中文](README.zh-CN.md)
+**English** | [中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 **⚠️ AUTHORIZED SECURITY TESTING ONLY — see [DISCLAIMER.md](DISCLAIMER.md).**
 
