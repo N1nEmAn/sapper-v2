@@ -3043,7 +3043,21 @@ def cmd_serve(args) -> int:
     db_path = mod.index_path(store.root)
     db = mod.IndexDB(db_path)
 
-    if args.rebuild or not db.exists():
+    def _index_usable() -> bool:
+        try:
+            db.graph()
+            return True
+        except Exception:
+            return False
+
+    rebuild = args.rebuild or not db.exists() or not _index_usable()
+    if rebuild:
+        if db_path.exists() and not _index_usable():
+            print("index unusable (corrupt or schema drift), recreating", file=sys.stderr)
+            try:
+                db_path.unlink()
+            except OSError as exc:
+                raise FGError(f"cannot remove corrupt index {db_path}: {exc}") from exc
         db.init()
         result = db.rebuild(store.list_facts(), store.list_intents())
         print(f"index: {result['facts']} facts, {result['intents']} intents -> {db_path}")

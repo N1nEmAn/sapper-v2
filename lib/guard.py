@@ -165,6 +165,14 @@ def _under_domains(host: str, domains: list[str]) -> bool:
     return False
 
 
+def _is_private_target(target: str) -> bool:
+    """Private IPv4/CIDR counts as lab-safe. Domains are always public."""
+    try:
+        return ipaddress.ip_network(target, strict=False).is_private
+    except ValueError:
+        return False
+
+
 class Guard:
     def __init__(self, scope: dict | None = None, rules: dict | None = None) -> None:
         self.scope = scope or {"cidrs": [], "domains": [], "notes": ""}
@@ -195,7 +203,16 @@ class Guard:
         if check_scope and self.targets:
             has_scope = bool(self.scope["cidrs"] or self.scope["domains"])
             if not has_scope:
-                decision.bump("ask", "未设置授权范围 (.sapper/scope.json)，无法校验目标")
+                # No declared scope: let private ranges through (lab/CTF is the
+                # common case) but make the operator declare scope before
+                # touching anything public.
+                public = [t for t in self.targets if not _is_private_target(t)]
+                if public:
+                    decision.bump(
+                        "ask",
+                        f"未声明授权范围，目标含公网地址: {', '.join(public[:3])} "
+                        f"(用 sapper scope add 声明)",
+                    )
             else:
                 outside = []
                 for target in self.targets:
