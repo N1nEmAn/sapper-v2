@@ -2991,6 +2991,49 @@ def cmd_scope(args) -> int:
     raise FGError(f"unknown scope action: {action}")
 
 
+def cmd_audit(args) -> int:
+    """Scan an executor transcript for risky or out-of-scope operations."""
+    store = Store(Path(args.store))
+    store.require()
+    guard_mod = _load_lib("guard", "guard.py")
+    guard = guard_mod.Guard.for_project(store.root)
+
+    if args.file:
+        path = Path(args.file)
+        if not path.is_file():
+            raise FGError(f"日志文件不存在: {path}")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        source = str(path)
+    elif args.text:
+        text = args.text
+        source = "(inline)"
+    else:
+        raise FGError("audit 需要 --file <日志> 或 --text <文本>")
+
+    audit_mod = _load_lib("audit", "audit.py")
+    findings = audit_mod.scan(text, guard)
+
+    if not findings:
+        print(f"audit: {source} 未发现可疑操作")
+        return 0
+
+    print(f"audit: {source} 发现 {len(findings)} 项可疑")
+    for item in findings[:10]:
+        print(f"  [{item['action']}] {item['cmd'][:90]}")
+        for reason in item["reasons"][:2]:
+            print(f"      - {reason}")
+
+    if args.record:
+        fact = store.add_fact(
+            description=f"审计 {source}: {audit_mod.summarize(findings)}",
+            creator="audit",
+            title="审计告警",
+            kind="note",
+        )
+        print(f"recorded as {fact['id']}")
+    return 0
+
+
 def cmd_serve(args) -> int:
     """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
     store = Store(Path(args.store))
@@ -4698,6 +4741,13 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["show", "add", "clear"], help="default: show")
     sp.add_argument("values", nargs="*", help="CIDRs (10.0.0.0/24) or domains (example.com)")
     sp.set_defaults(func=cmd_scope)
+
+    sp = sub.add_parser("audit", help="scan an executor transcript for risky operations")
+    sp.add_argument("--file", help="log/transcript file to scan")
+    sp.add_argument("--text", help="inline text to scan")
+    sp.add_argument("--record", action="store_true",
+                    help="write a fact when findings exist")
+    sp.set_defaults(func=cmd_audit)
 
     sp = sub.add_parser("serve", help="web console over the SQLite index")
     sp.add_argument("--host", default="127.0.0.1", help="bind address")
