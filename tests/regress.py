@@ -22,7 +22,9 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SAPPER = ROOT / "bin" / "sapper_win.py"
+# Windows uses the launcher (injects an fcntl shim); Linux can run sapper.py
+# directly and hit the real fcntl path. Override with SAPPER_ENTRY.
+ENTRY = Path(os.environ.get("SAPPER_ENTRY", str(ROOT / "bin" / "sapper_win.py")))
 
 PASS: list[str] = []
 FAIL: list[tuple[str, str]] = []
@@ -32,7 +34,7 @@ FAIL: list[tuple[str, str]] = []
 # harness
 # --------------------------------------------------------------------------- #
 def run(*args: str, cwd: Path, check: bool = True, env: dict | None = None):
-    cmd = [sys.executable, str(SAPPER), *args]
+    cmd = [sys.executable, str(ENTRY), *args]
     full_env = dict(os.environ)
     full_env.pop("SAPPER_EVENTS", None)
     full_env.update(env or {})
@@ -71,6 +73,111 @@ def fresh() -> Path:
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# full command surface
+# --------------------------------------------------------------------------- #
+@case("surface: 所有无外部依赖的命令都能跑通")
+def surface_all_commands():
+    work = Path(tempfile.mkdtemp(prefix="sapper-surface-"))
+    try:
+        run("init", "--goal", "全命令烟测", cwd=work)
+
+        steps = [
+            ("status",),
+            ("graph",),
+            ("validate",),
+            ("frontier",),
+            ("fact", "-t", "主机", "-k", "host", "-d", "host=10.0.0.5", "说明"),
+            ("intent", "--from", "f001", "-t", "扫描", "描述"),
+            ("hint", "人工提示"),
+            ("hint", "--list"),
+            ("show", "fact", "f001"),
+            ("show", "intent", "i001"),
+            ("pick",),
+            ("claim", "i001", "--worker", "w"),
+            ("doc", "i001", "--set", "详细方案"),
+            ("doc", "i001"),
+            ("recall", "扫描"),
+            ("release", "i001", "--worker", "w"),
+            ("claim", "i001", "--worker", "w"),
+            ("done", "i001", "--worker", "w", "--fact", "扫到了", "-k", "service"),
+            ("view", "--out", str(work / "graph.html")),
+            ("scope", "add", "10.0.0.0/24"),
+            ("scope",),
+            ("kb", "search", "tomcat"),
+            ("flag", "flag{test}", "-c", "ch1"),
+            ("complete", "--from", "f002", "--note", "达成", "--worker", "w"),
+            ("status",),
+        ]
+        bad = []
+        for args in steps:
+            proc = run(*args, cwd=work, check=False)
+            if "Traceback" in proc.stderr:
+                bad.append((args[0], proc.stderr.strip().splitlines()[-1][:120]))
+        assert not bad, "以下命令抛异常: " + "; ".join(f"{a}: {e}" for a, e in bad)
+
+        assert (work / "graph.html").exists(), "view 未生成 HTML"
+        assert (work / ".sapper" / "hints").exists(), "hint 目录缺失"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("sync: 所有写操作后索引与 JSON 一致")
+def sync_all_writes():
+    work = Path(tempfile.mkdtemp(prefix="sapper-sync-"))
+    try:
+        run("init", "--goal", "同步测试", cwd=work)
+
+        sys.path.insert(0, str(ROOT / "lib"))
+        from index_db import IndexDB
+
+        db = IndexDB(work / ".sapper" / "index.db")
+        db.init()
+        db.rebuild(
+            [read_json(p) for p in sorted((work / ".sapper" / "facts").glob("*.json"))],
+            [],
+        )
+
+        run("fact", "-t", "h", "-k", "host", "-d", "host=10.0.0.5", "x", cwd=work)
+        run("intent", "--from", "f001", "-t", "i", "d", cwd=work)
+        run("claim", "i001", "--worker", "w", cwd=work)
+        run("doc", "i001", "--set", "方案正文", cwd=work)
+        run("release", "i001", "--worker", "w", cwd=work)
+        run("claim", "i001", "--worker", "w", cwd=work)
+        run("done", "i001", "--worker", "w", "--fact", "结果", "-k", "vuln", cwd=work)
+        run("fact", "-t", "h2", "-k", "cred", "-d", "user=a", "y", cwd=work)
+        run("complete", "--from", "f002", "--note", "done", "--worker", "w", cwd=work)
+
+        graph = db.graph()
+        problems = []
+        for path in sorted((work / ".sapper" / "facts").glob("*.json")):
+            disk = read_json(path)
+            hit = next((f for f in graph["facts"] if f["id"] == disk["id"]), None)
+            if hit is None:
+                problems.append(f"{disk['id']} 不在索引")
+            elif (hit.get("doc") or "") != (disk.get("doc") or ""):
+                problems.append(f"{disk['id']} doc 不同步")
+            elif (hit.get("description") or "") != (disk.get("description") or ""):
+                problems.append(f"{disk['id']} description 不同步")
+
+        for path in sorted((work / ".sapper" / "intents").glob("*.json")):
+            disk = read_json(path)
+            hit = next((i for i in graph["intents"] if i["id"] == disk["id"]), None)
+            if hit is None:
+                problems.append(f"{disk['id']} 不在索引")
+            elif hit.get("status") != disk.get("status"):
+                problems.append(f"{disk['id']} status {hit.get('status')} != {disk.get('status')}")
+
+        assert not problems, "索引漂移: " + "; ".join(problems[:6])
+
+        events = [e["event"] for e in db.events_since(0)]
+        for expected in ("fact.created", "intent.created", "intent.claimed",
+                         "intent.released", "doc.updated", "intent.done", "project.done"):
+            assert expected in events, f"缺少事件 {expected}，实际: {events}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -527,7 +634,7 @@ def serve_readonly():
             port = sock.getsockname()[1]
 
         proc = subprocess.Popen(
-            [sys.executable, str(SAPPER), "serve", "--port", str(port), "--rebuild"],
+            [sys.executable, str(ENTRY), "serve", "--port", str(port), "--rebuild"],
             cwd=str(work), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
@@ -563,6 +670,7 @@ def serve_readonly():
 # main
 # --------------------------------------------------------------------------- #
 SUITES = {
+    "surface": [surface_all_commands, sync_all_writes],
     "cli": [cli_setup, cli_lifecycle, cli_reads, cli_rejects_bad_kind],
     "guard": [
         guard_private_no_scope, guard_public_no_scope, guard_out_of_scope,

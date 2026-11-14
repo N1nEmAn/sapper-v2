@@ -173,6 +173,13 @@ def _index_event(root: Path, event: str, payload: dict) -> None:
             db.upsert_fact(fact)
         if isinstance(intent, dict):
             db.upsert_intent(intent)
+        # Some paths (doc update) return a generic node; decide by shape.
+        node = payload.get("node")
+        if isinstance(node, dict) and not isinstance(fact, dict):
+            if "from" in node or "requires_confirmation" in node:
+                db.upsert_intent(node)
+            elif "description" in node:
+                db.upsert_fact(node)
         clean = {
             k: v
             for k, v in payload.items()
@@ -181,6 +188,16 @@ def _index_event(root: Path, event: str, payload: dict) -> None:
         db.append_event(event, clean)
     except Exception:  # pragma: no cover - index is optional
         pass
+
+
+def _publish_store(store, event: str, **payload) -> None:
+    """Emit + index for CLI paths that write through Store directly.
+
+    Store methods cannot emit from inside their file lock (a subscriber that
+    reads the graph would deadlock), so the CLI layer publishes after the call.
+    """
+    _emit(event, **payload)
+    _index_event(store.root, event, payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -2848,6 +2865,7 @@ def cmd_doc(args) -> int:
             new_doc = args.set
         new_doc = new_doc.strip() if isinstance(new_doc, str) else None
         node = store.update_doc(args.id, new_doc, expected_doc=expected_doc)
+        _publish_store(store, "doc.updated", node=node)
         print(f"updated doc for {args.id} ({len(node['doc'] or '')} chars)" if node["doc"]
               else f"cleared doc for {args.id}")
         return 0
@@ -2915,6 +2933,7 @@ def cmd_release(args) -> int:
     store.require()
     worker = args.worker or f"agent-{os.getpid()}"
     intent = store.release_intent(args.id, worker)
+    _publish_store(store, "intent.released", intent=intent)
     print(f"released {intent['id']}")
     return 0
 
@@ -2959,6 +2978,7 @@ def cmd_complete(args) -> int:
     from_ids = parse_from(args.from_)
     note = args.note or "goal satisfied"
     intent = store.complete_project(from_ids, note, args.worker)
+    _publish_store(store, "project.done", intent=intent)
     print(f"project complete via {intent['id']} (goal)")
     return 0
 
