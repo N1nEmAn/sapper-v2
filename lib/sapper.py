@@ -639,7 +639,8 @@ class Store:
                 raise FGError(f"intent {iid} already confirmed")
             intent["confirmed_at"] = now_iso()
             self.save_intent(intent)
-            return intent
+        self._publish("intent.confirmed", intent=intent)
+        return intent
 
     # -- hints --
     def list_hints(self) -> list[dict]:
@@ -3008,8 +3009,15 @@ def cmd_serve(args) -> int:
     if not (web_root / "index.html").is_file():
         raise FGError(f"web console not found under {web_root}")
 
+    confirm_cb = None
+    if getattr(args, "allow_write", False):
+        def confirm_cb(iid: str) -> None:
+            intent = store.confirm_intent(iid)
+            print(f"confirmed {intent['id']} via web console", file=sys.stderr)
+        print("write enabled: POST /api/confirm/<id> is allowed (127.0.0.1 only)")
+
     srv_mod = _load_lib("server", "server.py")
-    console = srv_mod.Console(db_path, web_root, args.host, args.port)
+    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb)
     try:
         console.serve_forever()
     except KeyboardInterrupt:
@@ -3049,6 +3057,14 @@ def _guard_intent(store: Store, intent: dict, args) -> None:
 
     if intent.get("confirmed_at"):
         return
+
+    # Make `sapper confirm` usable: an intent flagged by the guard must carry
+    # the confirmation bit, otherwise confirm_intent() would reject it.
+    if not intent.get("requires_confirmation"):
+        updated = dict(intent)
+        updated["requires_confirmation"] = True
+        store.save_intent(updated)
+        _index_event(store.root, "intent.confirmation_required", {"intent": updated})
 
     raise FGError(
         f"guard requires confirmation for {intent['id']}:\n{detail}\n"
@@ -4687,6 +4703,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", default="127.0.0.1", help="bind address")
     sp.add_argument("--port", type=int, default=8787, help="port")
     sp.add_argument("--rebuild", action="store_true", help="re-import JSON files into the index")
+    sp.add_argument("--allow-write", action="store_true",
+                    help="enable POST /api/confirm/<id> (approve intents from the console)")
     sp.set_defaults(func=cmd_serve)
 
     sp = sub.add_parser("dispatch", help="run a commander/executor step via the claude CLI")

@@ -34,6 +34,10 @@
        box-shadow:0 2px 8px rgba(0,0,0,.08);display:none;z-index:10}
   #tip .id{font-family:ui-monospace,monospace;color:var(--muted)}
   #tip .desc{margin-top:4px}
+  #tip .appr{margin-top:6px;font-size:11px;color:#3b6d11}
+  .appr-btn{margin-top:8px;padding:4px 10px;font-size:12px;cursor:pointer;
+            background:#eaf3de;border:1px solid #639922;border-radius:5px;color:#27500a}
+  .appr-btn:hover{background:#c0dd97}
   .link{stroke:#c9c7c0;stroke-width:1}
   .node text{font-size:10px;fill:#444;pointer-events:none}
   .legend{position:absolute;left:12px;bottom:12px;background:rgba(255,255,255,.9);
@@ -160,9 +164,24 @@ function drag(sim) {
 
 const tip = document.querySelector("#tip");
 function showTip(e,d) {
+  let extra = "";
+  if (d.type === "intent" && d.raw && d.raw.requires_confirmation) {
+    extra = d.raw.confirmed_at
+      ? `<div class="appr ok">已确认 ${d.raw.confirmed_at.slice(11,19)}</div>`
+      : `<button class="appr-btn" onclick="confirmIntent('${d.id}')">批准派发</button>`;
+  }
   tip.innerHTML = `<div class="id">${d.id} · ${d.type}${d.kind?" · "+d.kind:""}${
-    d.status?" · "+d.status:""}</div><div class="desc">${escapeHtml(d.desc)}</div>`;
+    d.status?" · "+d.status:""}</div><div class="desc">${escapeHtml(d.desc)}</div>${extra}`;
   tip.style.display = "block";
+}
+
+async function confirmIntent(id) {
+  try {
+    const r = await fetch(`/api/confirm/${id}`, {method:"POST"});
+    const d = await r.json();
+    if (d.ok) { hideTip(); await loadGraph(); }
+    else { alert("确认失败: " + (d.error || "unknown")); }
+  } catch (e) { alert("确认失败: " + e); }
 }
 function moveTip(e) {
   tip.style.left = (e.offsetX + 14) + "px";

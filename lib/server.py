@@ -30,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "sapper-console/1.0"
     db_path: Path | None = None
     web_root: Path | None = None
+    confirm_cb = None
 
     def log_message(self, fmt: str, *args) -> None:  # keep the console quiet
         return
@@ -120,21 +121,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # never crash the console on a bad request
             self._json({"error": str(exc)}, 500)
 
+    # -- writes: the only mutating endpoint --------------------------------
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        route = parsed.path.rstrip("/")
+
+        if route.startswith("/api/confirm/"):
+            iid = route.rsplit("/", 1)[-1]
+            if self.confirm_cb is None:
+                self._json({"error": "write disabled (start with --allow-write)"}, 403)
+                return
+            try:
+                self.confirm_cb(iid)
+                self._json({"ok": True, "id": iid})
+            except Exception as exc:
+                self._json({"error": str(exc)}, 400)
+            return
+
+        self._json({"error": "not found"}, 404)
+
 
 class Console:
-    def __init__(self, db_path: Path, web_root: Path, host: str = "127.0.0.1", port: int = 8787):
+    def __init__(self, db_path: Path, web_root: Path, host: str = "127.0.0.1",
+                 port: int = 8787, confirm_cb=None):
         self.db_path = db_path
         self.web_root = web_root
         self.host = host
         self.port = port
+        self.confirm_cb = confirm_cb
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def make_server(self) -> ThreadingHTTPServer:
+        # staticmethod: a plain function stored on the class would be bound as
+        # a method, and the handler instance would arrive as the first arg.
         handler = type(
             "BoundHandler",
             (Handler,),
-            {"db_path": self.db_path, "web_root": self.web_root},
+            {
+                "db_path": self.db_path,
+                "web_root": self.web_root,
+                "confirm_cb": staticmethod(self.confirm_cb) if self.confirm_cb else None,
+            },
         )
         return ThreadingHTTPServer((self.host, self.port), handler)
 
