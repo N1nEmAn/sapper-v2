@@ -1,0 +1,42 @@
+{
+  "id": "w003",
+  "name": "目录与端点枚举",
+  "family": "recon/dir",
+  "match": {"product": "any-web"},
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "gobuster 默认字典与线程数",
+      "command": "gobuster dir -u http://TARGET -w /usr/share/seclists/Discovery/Web-Content/common.txt -t 50",
+      "sig": ["gobuster", "User-Agent: gobuster"],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v2",
+      "desc": "ffuf 随机 UA + 并发降到 10 + 自动校准过滤",
+      "command": "ffuf -u http://TARGET/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-small-words.txt -t 10 -rate 20 -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ac",
+      "sig": [],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v3",
+      "desc": "只打已知框架路径清单，不发大字典",
+      "command": "for p in /actuator/env /actuator/heapdump /swagger-ui.html /v2/api-docs /.git/config /console; do curl -s -o /dev/null -w \"%{http_code} $p\\n\" http://TARGET$p; done",
+      "sig": [],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {
+    "traffic": "200 线程的目录爆破在流量侧极其显眼，v2 压到 20 req/s",
+    "artifact": "不落地结果文件到目标侧"
+  },
+  "notes": "先 v3 打已知路径（几十个请求），命中再考虑 v2 扩字典。",
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

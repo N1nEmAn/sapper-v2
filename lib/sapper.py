@@ -2991,6 +2991,134 @@ def cmd_scope(args) -> int:
     raise FGError(f"unknown scope action: {action}")
 
 
+def cmd_armory(args) -> int:
+    """Self-scoring weapon library (lives in ~/.sapper/armory)."""
+    mod = _load_lib("armory", "armory.py")
+    armory = mod.Armory()
+    action = getattr(args, "armory_action", None) or "list"
+
+    if action == "seed":
+        n = armory.seed()
+        print(f"seeded {n} weapon(s) into {armory.root}")
+        return 0
+
+    if action == "list":
+        items = armory.all()
+        if args.family:
+            items = [w for w in items if w.get("family") == args.family]
+        if not items:
+            print(f"武器库为空（{armory.root}）\n用 `sapper armory seed` 导入种子，或 `sapper armory add`")
+            return 0
+        items.sort(key=lambda w: w.get("family", ""))
+        for weapon in items:
+            print(mod.summarize(weapon))
+        print(f"\n共 {len(items)} 项，库位置 {armory.root}")
+        return 0
+
+    if action == "show":
+        if not args.target:
+            raise FGError("armory show 需要武器 id")
+        try:
+            weapon = armory.load(args.target)
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        if args.json:
+            print(json.dumps(weapon, ensure_ascii=False, indent=2))
+            return 0
+        print(f"{weapon['id']}  {weapon['name']}  [{weapon.get('family')}]")
+        if weapon.get("match"):
+            print(f"匹配条件: {json.dumps(weapon['match'], ensure_ascii=False)}")
+        if weapon.get("evasion"):
+            print(f"规避: {json.dumps(weapon['evasion'], ensure_ascii=False)}")
+        print("变体:")
+        for v in weapon["variants"]:
+            stats = v.get("stats", {})
+            flag = " [已弃用]" if v.get("deprecated") else ""
+            sig = f" sig={len(v.get('sig', []))}" if v.get("sig") else ""
+            print(
+                f"  {v['vid']:<4} conf={v.get('confidence', 0.5):.2f} "
+                f"tries={stats.get('tries', 0)} ok={stats.get('ok', 0)} "
+                f"blocked={stats.get('blocked', 0)}{sig}{flag}"
+            )
+            if v.get("desc"):
+                print(f"        {v['desc']}")
+            if v.get("command"):
+                print(f"        $ {v['command']}")
+        return 0
+
+    if action == "add":
+        if not args.name:
+            raise FGError("armory add 需要 --name")
+        variants = []
+        for spec in args.variant or []:
+            parts = spec.split(":", 2)
+            variants.append({
+                "vid": parts[0] or f"v{len(variants)+1}",
+                "desc": parts[1] if len(parts) > 1 else "",
+                "command": parts[2] if len(parts) > 2 else "",
+            })
+        if not variants:
+            variants = [{"vid": "v1", "desc": "基础", "command": ""}]
+        weapon = armory.add(
+            name=args.name,
+            family=args.family or "misc",
+            variants=variants,
+        )
+        print(f"{weapon['id']}  {weapon['name']}  ({len(weapon['variants'])} 个变体)")
+        return 0
+
+    if action == "search":
+        if not args.target:
+            raise FGError("armory search 需要关键词")
+        hits = armory.search(args.target)
+        if not hits:
+            print(f"没有匹配 {args.target!r} 的武器")
+            return 0
+        for weapon in hits:
+            print(mod.summarize(weapon))
+        return 0
+
+    if action == "use":
+        if not args.target:
+            raise FGError("armory use 需要武器 id")
+        try:
+            weapon = armory.load(args.target)
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        if args.vid:
+            chosen = next((v for v in weapon["variants"] if v["vid"] == args.vid), None)
+            if chosen is None:
+                raise FGError(f"{weapon['id']} 没有变体 {args.vid}")
+        else:
+            chosen = armory.best_variant(weapon, skip_sig_rich=args.lean)
+            if chosen is None:
+                raise FGError(f"{weapon['id']} 没有可用变体（全部已弃用）")
+        print(f"{weapon['id']}/{chosen['vid']}  conf={chosen.get('confidence', 0.5):.2f}")
+        if chosen.get("desc"):
+            print(f"# {chosen['desc']}")
+        if chosen.get("command"):
+            print(chosen["command"])
+        return 0
+
+    if action == "report":
+        if not args.target or not args.vid or not args.result:
+            raise FGError("armory report 需要 <id> --vid <vid> --result ok|blocked|fail")
+        try:
+            weapon = armory.report(args.target, args.vid, args.result)
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        v = next(v for v in weapon["variants"] if v["vid"] == args.vid)
+        print(
+            f"{weapon['id']}/{v['vid']} 记录 {args.result}: "
+            f"conf={v.get('confidence', 0.5):.2f} "
+            f"tries={v['stats']['tries']} ok={v['stats']['ok']}"
+            + ("  [连续失败，已弃用]" if v.get("deprecated") else "")
+        )
+        return 0
+
+    raise FGError(f"unknown armory action: {action}")
+
+
 def cmd_audit(args) -> int:
     """Scan an executor transcript for risky or out-of-scope operations."""
     store = Store(Path(args.store))
@@ -4770,6 +4898,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--record", action="store_true",
                     help="write a fact when findings exist")
     sp.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("armory", help="self-scoring weapon library")
+    sp.add_argument("armory_action", nargs="?", default="list",
+                    choices=["list", "show", "add", "search", "use", "report", "seed"])
+    sp.add_argument("target", nargs="?", help="weapon id (or keyword for search)")
+    sp.add_argument("--name", help="weapon name (add)")
+    sp.add_argument("--family", help="family, e.g. exploit/tomcat (add, list filter)")
+    sp.add_argument("--variant", action="append",
+                    help="vid:desc:command (add, repeatable)")
+    sp.add_argument("--vid", help="variant id (use, report)")
+    sp.add_argument("--lean", action="store_true",
+                    help="prefer variants with fewer signatures (use)")
+    sp.add_argument("--result", choices=["ok", "blocked", "fail"], help="outcome (report)")
+    sp.add_argument("--json", action="store_true", help="raw json (show)")
+    sp.set_defaults(func=cmd_armory)
 
     sp = sub.add_parser("serve", help="web console over the SQLite index")
     sp.add_argument("--host", default="127.0.0.1", help="bind address")

