@@ -116,22 +116,25 @@ class FGError(Exception):
 # --------------------------------------------------------------------------- #
 # events
 # --------------------------------------------------------------------------- #
-_BUS_MODULE = None
+_LIB_CACHE: dict = {}
 
 
-def _bus():
-    """Load lib/bus.py lazily by path (sapper's modules are file-loaded)."""
-    global _BUS_MODULE
-    if _BUS_MODULE is None:
+def _load_lib(name: str, filename: str):
+    """Load a sibling module by path (sapper's modules are file-loaded)."""
+    if name not in _LIB_CACHE:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
-            "sapper_bus", Path(__file__).with_name("bus.py")
+            f"sapper_{name}", Path(__file__).with_name(filename)
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        _BUS_MODULE = module
-    return _BUS_MODULE.bus()
+        _LIB_CACHE[name] = module
+    return _LIB_CACHE[name]
+
+
+def _bus():
+    return _load_lib("bus", "bus.py").bus()
 
 
 def _emit(event: str, **payload) -> int:
@@ -141,6 +144,33 @@ def _emit(event: str, **payload) -> int:
     except Exception as exc:  # pragma: no cover - defensive
         print(f"[bus] emit failed: {exc}", file=sys.stderr)
         return 0
+
+
+def _index_event(root: Path, event: str, payload: dict) -> None:
+    """Mirror a change into .sapper/index.db when that project has one.
+
+    Best-effort: a missing or broken index must never fail a command.
+    """
+    try:
+        db_path = root / "index.db"
+        if not db_path.exists():
+            return
+        mod = _load_lib("index_db", "index_db.py")
+        db = mod.IndexDB(db_path)
+        fact = payload.get("fact")
+        intent = payload.get("intent")
+        if isinstance(fact, dict):
+            db.upsert_fact(fact)
+        if isinstance(intent, dict):
+            db.upsert_intent(intent)
+        clean = {
+            k: v
+            for k, v in payload.items()
+            if isinstance(v, (dict, list, str, int, float, bool)) or v is None
+        }
+        db.append_event(event, clean)
+    except Exception:  # pragma: no cover - index is optional
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +186,12 @@ class Store:
         self.hints_dir = root / "hints"
         self.project_file = root / "project.json"
         self.lock_file = root / LOCK_NAME
+
+    # -- events --
+    def _publish(self, event: str, **payload) -> None:
+        """Notify subscribers and mirror into the optional SQLite index."""
+        _emit(event, **payload)
+        _index_event(self.root, event, payload)
 
     # -- existence --
     def exists(self) -> bool:
@@ -313,7 +349,7 @@ class Store:
                 source["concluded_at"] = now_iso()
                 source["worker"] = creator or source.get("worker")
                 self.save_intent(source)
-        _emit("fact.created", fact=fact)
+        self._publish("fact.created", fact=fact)
         return fact
 
     # -- intents --
@@ -377,7 +413,7 @@ class Store:
                 "concluded_at": None,
             }
             atomic_write_json(self.intents_dir / f"{iid}.json", intent)
-        _emit("intent.created", intent=intent)
+        self._publish("intent.created", intent=intent)
         return intent
 
     def save_intent(self, intent: dict) -> None:
@@ -466,7 +502,7 @@ class Store:
                 project["status"] = "completed"
                 project["completed_at"] = now_iso()
                 self.save_project(project)
-        _emit("intent.done", intent=intent)
+        self._publish("intent.done", intent=intent)
         return intent
 
     def complete_project(self, from_ids: list[str], note: str, worker: str) -> dict:
@@ -550,8 +586,8 @@ class Store:
             intent["concluded_at"] = now_iso()
             intent["worker"] = worker or intent.get("worker")
             self.save_intent(intent)
-        _emit("fact.created", fact=fact)
-        _emit("intent.done", intent=intent, fact=fact)
+        self._publish("fact.created", fact=fact)
+        self._publish("intent.done", intent=intent, fact=fact)
         return fact, intent
 
     def claim_intent(self, iid: str, worker: str) -> dict:
@@ -567,7 +603,7 @@ class Store:
             intent["worker"] = worker
             intent["status"] = "claimed"
             self.save_intent(intent)
-        _emit("intent.claimed", intent=intent)
+        self._publish("intent.claimed", intent=intent)
         return intent
 
     def release_intent(self, iid: str, worker: str) -> dict:
@@ -613,7 +649,7 @@ class Store:
                 "created_at": now_iso(),
             }
             atomic_write_json(self.hints_dir / f"{hid}.json", hint)
-        _emit("hint.added", hint=hint)
+        self._publish("hint.added", hint=hint)
         return hint
 
     def update_flag_fact(self, fid: str, status: str, result_note: str | None) -> dict:
@@ -2903,6 +2939,33 @@ def cmd_confirm(args) -> int:
 
 
 # -- dispatch (LLM) --
+def cmd_serve(args) -> int:
+    """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
+    store = Store(Path(args.store))
+    store.require()
+
+    mod = _load_lib("index_db", "index_db.py")
+    db_path = mod.index_path(store.root)
+    db = mod.IndexDB(db_path)
+
+    if args.rebuild or not db.exists():
+        db.init()
+        result = db.rebuild(store.list_facts(), store.list_intents())
+        print(f"index: {result['facts']} facts, {result['intents']} intents -> {db_path}")
+
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    if not (web_root / "index.html").is_file():
+        raise FGError(f"web console not found under {web_root}")
+
+    srv_mod = _load_lib("server", "server.py")
+    console = srv_mod.Console(db_path, web_root, args.host, args.port)
+    try:
+        console.serve_forever()
+    except KeyboardInterrupt:
+        print("\nconsole stopped")
+    return 0
+
+
 def cmd_dispatch(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -4522,6 +4585,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("confirm", help="confirm an intent that required it")
     sp.add_argument("id")
     sp.set_defaults(func=cmd_confirm)
+
+    sp = sub.add_parser("serve", help="web console over the SQLite index")
+    sp.add_argument("--host", default="127.0.0.1", help="bind address")
+    sp.add_argument("--port", type=int, default=8787, help="port")
+    sp.add_argument("--rebuild", action="store_true", help="re-import JSON files into the index")
+    sp.set_defaults(func=cmd_serve)
 
     sp = sub.add_parser("dispatch", help="run a commander/executor step via the claude CLI")
     sp.add_argument("target", help="'reason' | 'verify' | <intent-id>")
