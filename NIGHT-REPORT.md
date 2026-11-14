@@ -213,16 +213,79 @@ recorded as f002
 
 支持三种 transcript 格式：`$ cmd`、`[bash] cmd`、`● Bash(cmd)`。
 
-## 下一步（P3）
+## P3 已完成：自评分武器库
 
-P3 是 MITM 流量录制。要点：
+这是你最初提的「自进化工具库」。
 
-- 用 `mitmproxy`，不自研代理
-- addon 把请求写进 `traffic` 表（P1 已有 SQLite，加一张表即可）
-- **必须先过滤再入库**，否则三天爆库：只存 2xx/3xx、非静态资源、含敏感关键字的
-- 前端加「流量」页，可按域名/状态码/关键字搜索
+### 数据模型
 
-预计 4–5 小时。注意证书固定（pinning）的目标录不到，这是硬限制。
+一个武器 = 一个手法 + **多个变体**。变体是同一攻击的不同表达，针对不同防御：
+
+```
+w002  SQL 注入联合查询探测  [web/sqli]
+  v1  conf=0.50  sig=4   sqlmap 默认 UA 与 payload
+  v2  conf=0.20  sig=0   随机 UA + tamper + 限速      [已弃用]
+  v3  conf=0.75  sig=0   手工布尔盲注，单请求验证
+```
+
+`sig` 是该变体的**检测特征**（会被 WAF 认出来的字符串）。sig 越少越隐蔽。
+
+### 自进化闭环
+
+```
+sapper done i001 --fact "注入成功" --weapon w002 --vid v3 --result ok
+  → intent 收尾 + 武器记分，一步完成
+```
+
+评分用拉普拉斯平滑 `(ok+1)/(tries+2)`：
+
+| 事件 | 置信度变化 |
+|---|---|
+| 初始 | 0.50（无信息）|
+| 成功 1 次 | 0.67 |
+| 成功 2 次 | 0.75 |
+| 被拦 1 次 | 0.33 |
+| 被拦 3 次 | 0.20 → **自动弃用** |
+
+下次 `sapper armory use w002` 会自动跳过弃用的 v2，选 conf 最高的 v3。
+
+### 命令
+
+```bash
+sapper armory seed                          # 导入 4 个种子武器
+sapper armory list [--family web/sqli]
+sapper armory search tomcat
+sapper armory show w002
+sapper armory use w002 --lean               # --lean 优先零特征变体
+sapper armory add --name "..." --family ... --variant "v1:描述:命令"
+sapper armory report w002 --vid v2 --result blocked
+```
+
+武器库在 `~/.sapper/armory`（跨项目共享），可用 `SAPPER_ARMORY_ROOT` 覆盖。
+
+### 种子武器（kb/armory/）
+
+| id | 手法 | 变体对比 |
+|---|---|---|
+| w001 | Tomcat Ghostcat | ajpShooter 原始 / 自组 AJP 帧分片 |
+| w002 | SQL 注入 | sqlmap 默认 / 随机UA+tamper+限速 / 手工盲注 |
+| w003 | 目录枚举 | gobuster 50线程 / ffuf 20rps / 只打已知路径 |
+| w004 | SSRF | 127.0.0.1 / 整数与八进制 IP / DNS 重绑定 |
+
+每个变体都标注了它的检测特征，这是"去特征"的可量化基础。
+
+### 还没做的
+
+**变体自动生成**：现在被拦三次只是标记弃用，不会自动生成新变体。要让 LLM 根据"被什么拦了"来变异（比如从 w002/v2 的被拦记录推出该换什么编码），需要 P4 里加一个 `intent.confirmation_required` 之外的触发点。
+
+## 下一步（P4 / P5）
+
+| 期 | 内容 | 预计 |
+|---|---|---|
+| **P4** | 资产图 + 跨任务复用（ARTEX 的双图思路）| 5 小时 |
+| **P5** | MITM 流量录制（mitmproxy + traffic 表）| 4 小时 |
+
+P4 的价值：sapper 现在的图是**一次性的**，打完一场就结束。加了全局资产库后，下次打同一家公司能接着上次的资产往下走。
 
 ---
 
