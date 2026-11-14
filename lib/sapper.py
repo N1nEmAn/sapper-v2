@@ -3079,6 +3079,14 @@ def cmd_serve(args) -> int:
         console.serve_forever()
     except KeyboardInterrupt:
         print("\nconsole stopped")
+    except OSError as exc:
+        # Windows reports a taken port as 10013 (access denied) rather than
+        # 10048 (in use), so spell out both possibilities.
+        raise FGError(
+            f"无法绑定 {args.host}:{args.port} ({exc})\n"
+            f"  - 端口被占用: 换个端口试试 `sapper serve --port {args.port + 1000}`\n"
+            f"  - 或被系统保留: `netsh int ipv4 show excludedportrange protocol=tcp` 查看"
+        ) from exc
     return 0
 
 
