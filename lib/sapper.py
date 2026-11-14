@@ -114,6 +114,36 @@ class FGError(Exception):
 
 
 # --------------------------------------------------------------------------- #
+# events
+# --------------------------------------------------------------------------- #
+_BUS_MODULE = None
+
+
+def _bus():
+    """Load lib/bus.py lazily by path (sapper's modules are file-loaded)."""
+    global _BUS_MODULE
+    if _BUS_MODULE is None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "sapper_bus", Path(__file__).with_name("bus.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _BUS_MODULE = module
+    return _BUS_MODULE.bus()
+
+
+def _emit(event: str, **payload) -> int:
+    """Broadcast a domain event. Telemetry must never break a command."""
+    try:
+        return _bus().emit(event, **payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[bus] emit failed: {exc}", file=sys.stderr)
+        return 0
+
+
+# --------------------------------------------------------------------------- #
 # store
 # --------------------------------------------------------------------------- #
 class Store:
@@ -283,7 +313,8 @@ class Store:
                 source["concluded_at"] = now_iso()
                 source["worker"] = creator or source.get("worker")
                 self.save_intent(source)
-            return fact
+        _emit("fact.created", fact=fact)
+        return fact
 
     # -- intents --
     def list_intents(self) -> list[dict]:
@@ -346,7 +377,8 @@ class Store:
                 "concluded_at": None,
             }
             atomic_write_json(self.intents_dir / f"{iid}.json", intent)
-            return intent
+        _emit("intent.created", intent=intent)
+        return intent
 
     def save_intent(self, intent: dict) -> None:
         _validate_lookup_id(intent.get("id"), "intent")
@@ -434,7 +466,8 @@ class Store:
                 project["status"] = "completed"
                 project["completed_at"] = now_iso()
                 self.save_project(project)
-            return intent
+        _emit("intent.done", intent=intent)
+        return intent
 
     def complete_project(self, from_ids: list[str], note: str, worker: str) -> dict:
         """Create the terminal goal edge atomically with the project status."""
@@ -517,7 +550,9 @@ class Store:
             intent["concluded_at"] = now_iso()
             intent["worker"] = worker or intent.get("worker")
             self.save_intent(intent)
-            return fact, intent
+        _emit("fact.created", fact=fact)
+        _emit("intent.done", intent=intent, fact=fact)
+        return fact, intent
 
     def claim_intent(self, iid: str, worker: str) -> dict:
         with self.locked():
@@ -532,7 +567,8 @@ class Store:
             intent["worker"] = worker
             intent["status"] = "claimed"
             self.save_intent(intent)
-            return intent
+        _emit("intent.claimed", intent=intent)
+        return intent
 
     def release_intent(self, iid: str, worker: str) -> dict:
         with self.locked():
@@ -577,7 +613,8 @@ class Store:
                 "created_at": now_iso(),
             }
             atomic_write_json(self.hints_dir / f"{hid}.json", hint)
-            return hint
+        _emit("hint.added", hint=hint)
+        return hint
 
     def update_flag_fact(self, fid: str, status: str, result_note: str | None) -> dict:
         """Lifecycle update for a flag fact: recorded -> submitted/rejected.

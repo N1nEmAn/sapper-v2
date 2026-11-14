@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# sapper launcher for Git Bash on Windows.
+# Loads ../.env.local (model gateway + key) before running the CLI.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ENVFILE="$HERE/../.env.local"
+if [[ -f "$ENVFILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENVFILE"
+  set +a
+fi
+exec python "$HERE/sapper_win.py" "$@"
