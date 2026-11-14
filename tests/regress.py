@@ -458,6 +458,35 @@ def armory_use_best():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@case("armory: done --weapon 自动记分")
+def armory_done_link():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+        run("fact", "-t", "h", "-k", "host", "-d", "host=10.0.0.5", "x", cwd=work)
+        run("intent", "--from", "f001", "-t", "t", "d", cwd=work)
+        run("claim", "i001", "--worker", "w", cwd=work)
+
+        out = run("done", "i001", "--worker", "w", "--fact", "r", "-k", "vuln",
+                  "--weapon", "w002", "--vid", "v3", "--result", "ok",
+                  cwd=work, env=env).stdout
+        assert "conf=0.67" in out, f"done 应触发武器记分:\n{out}"
+
+        show = run("armory", "show", "w002", cwd=work, env=env).stdout
+        assert "tries=1 ok=1" in show, f"武器库应已更新:\n{show[:400]}"
+
+        # 缺 --vid 时应在动手前就拒绝
+        run("intent", "--from", "f001", "-t", "x", "y", cwd=work)
+        proc = run("done", "i002", "--fact", "z", "--weapon", "w002",
+                   cwd=work, env=env, check=False)
+        assert proc.returncode != 0 and "--vid" in (proc.stderr + proc.stdout), (
+            f"缺 --vid 应被拒绝:\n{proc.stdout}{proc.stderr}"
+        )
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @case("armory: 未知武器/变体给出可读错误")
 def armory_errors():
     work = fresh()
@@ -542,7 +571,8 @@ SUITES = {
     ],
     "index": [index_missing_ok, index_corrupt_ok, index_sync],
     "audit": [audit_findings, audit_clean],
-    "armory": [armory_basic, armory_scoring, armory_deprecate, armory_use_best, armory_errors],
+    "armory": [armory_basic, armory_scoring, armory_deprecate, armory_use_best,
+               armory_done_link, armory_errors],
     "serve": [serve_readonly],
 }
 

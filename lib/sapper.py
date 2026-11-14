@@ -2922,12 +2922,34 @@ def cmd_release(args) -> int:
 def cmd_done(args) -> int:
     store = Store(Path(args.store))
     store.require()
+
+    weapon_id = getattr(args, "weapon", None)
+    weapon_vid = getattr(args, "vid", None)
+    if weapon_id and not weapon_vid:
+        raise FGError("--weapon 需要同时指定 --vid <变体>")
+
     # atomic fact-create + conclude (no orphan if intent already done — review H1)
     fact, intent = store.conclude_with_new_fact(
         args.id, args.fact, args.worker, title=args.title, doc=_read_doc_arg(args),
         kind=args.kind, data=parse_kv_pairs(args.data),
     )
     print(f"{args.id} -> {fact['id']}  ({intent['status']})")
+
+    # Weapon bookkeeping is best-effort: the intent is already concluded, so a
+    # bad weapon id must not make the command look failed.
+    if weapon_id:
+        outcome = getattr(args, "result", None) or "ok"
+        try:
+            mod = _load_lib("armory", "armory.py")
+            weapon = mod.Armory().report(weapon_id, weapon_vid, outcome)
+            variant = next(v for v in weapon["variants"] if v["vid"] == weapon_vid)
+            print(
+                f"  weapon {weapon_id}/{weapon_vid} -> {outcome}  "
+                f"conf={variant.get('confidence', 0.5):.2f}"
+                + ("  [已弃用]" if variant.get("deprecated") else "")
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"  [warn] 武器记录未写入: {exc}", file=sys.stderr)
     return 0
 
 
@@ -4874,6 +4896,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--doc-file", default=None,
                     help="read the detailed document from this file path")
     sp.add_argument("--worker", default="agent")
+    sp.add_argument("--weapon", default=None,
+                    help="weapon id to score with this outcome (e.g. w002)")
+    sp.add_argument("--vid", default=None, help="weapon variant id (required with --weapon)")
+    sp.add_argument("--result", choices=["ok", "blocked", "fail"], default=None,
+                    help="weapon outcome (default: ok)")
     sp.set_defaults(func=cmd_done)
 
     sp = sub.add_parser("complete", help="mark the project goal satisfied")
