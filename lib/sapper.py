@@ -120,15 +120,25 @@ _LIB_CACHE: dict = {}
 
 
 def _load_lib(name: str, filename: str):
-    """Load a sibling module by path (sapper's modules are file-loaded)."""
+    """Load a sibling module by path and register it in sys.modules.
+
+    Registration matters: dataclasses and pickle look the class's module up in
+    sys.modules by name, and fail on unregistered shadow modules.
+    """
+    key = f"sapper_{name}"
     if name not in _LIB_CACHE:
         import importlib.util
 
         spec = importlib.util.spec_from_file_location(
-            f"sapper_{name}", Path(__file__).with_name(filename)
+            key, Path(__file__).with_name(filename)
         )
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.modules[key] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(key, None)
+            raise
         _LIB_CACHE[name] = module
     return _LIB_CACHE[name]
 
@@ -2939,6 +2949,47 @@ def cmd_confirm(args) -> int:
 
 
 # -- dispatch (LLM) --
+def cmd_scope(args) -> int:
+    """Show or edit the authorized scope used by the pre-flight guard."""
+    store = Store(Path(args.store))
+    store.require()
+    mod = _load_lib("guard", "guard.py")
+    scope = mod.load_scope(store.root)
+
+    action = getattr(args, "scope_action", None) or "show"
+
+    if action == "show":
+        print(f"cidrs  : {', '.join(scope['cidrs']) or '(empty)'}")
+        print(f"domains: {', '.join(scope['domains']) or '(empty)'}")
+        print(f"notes  : {scope['notes'] or '-'}")
+        print("\n没有范围时，guard 对含目标的任务只提示不拦截。")
+        return 0
+
+    if action == "add":
+        if not args.values:
+            raise FGError("scope add 需要至少一个 CIDR 或域名")
+        for value in args.values:
+            value = value.strip()
+            is_cidr = "/" in value or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value)
+            if is_cidr:
+                if value not in scope["cidrs"]:
+                    scope["cidrs"].append(value)
+            else:
+                host = value.lower().lstrip(".")
+                if host not in scope["domains"]:
+                    scope["domains"].append(host)
+        mod.save_scope(store.root, scope)
+        print(f"scope updated: {len(scope['cidrs'])} cidrs, {len(scope['domains'])} domains")
+        return 0
+
+    if action == "clear":
+        mod.save_scope(store.root, {"cidrs": [], "domains": [], "notes": scope.get("notes", "")})
+        print("scope cleared")
+        return 0
+
+    raise FGError(f"unknown scope action: {action}")
+
+
 def cmd_serve(args) -> int:
     """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
     store = Store(Path(args.store))
@@ -2966,6 +3017,45 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def _guard_intent(store: Store, intent: dict, args) -> None:
+    """Refuse to dispatch an intent that fails the pre-flight guard.
+
+    deny  -> the plan targets something out of scope, or is destructive.
+    ask   -> unverifiable (no scope set) or ships data outward.
+
+    Both are overridable, but only explicitly: `--force-guard`.
+    """
+    if getattr(args, "no_guard", False):
+        return
+
+    guard_mod = _load_lib("guard", "guard.py")
+    guard = guard_mod.Guard.for_project(store.root)
+    decision = guard.check_intent(intent)
+
+    if decision.action == "allow":
+        return
+
+    detail = "\n".join(f"  - {reason}" for reason in decision.reasons) or "  - (无细节)"
+
+    if decision.action == "deny":
+        if getattr(args, "force_guard", False):
+            print(f"[guard] DENIED but overridden by --force-guard:\n{detail}", file=sys.stderr)
+            return
+        raise FGError(
+            f"guard DENIED {intent['id']}:\n{detail}\n"
+            "确认无误可加 --force-guard 强制派发；"
+            f"或在 .sapper/scope.json 中补充授权范围"
+        )
+
+    if intent.get("confirmed_at"):
+        return
+
+    raise FGError(
+        f"guard requires confirmation for {intent['id']}:\n{detail}\n"
+        f"确认后运行: sapper confirm {intent['id']}"
+    )
+
+
 def cmd_dispatch(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -2991,6 +3081,7 @@ def cmd_dispatch(args) -> int:
     else:
         # treat as intent id -> explore
         intent = store.get_intent(args.target)
+        _guard_intent(store, intent, args)
         return _dispatch_explore(
             store, templates_dir, intent, model, timeout, skip, cwd, args
         )
@@ -4586,6 +4677,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id")
     sp.set_defaults(func=cmd_confirm)
 
+    sp = sub.add_parser("scope", help="show or edit the authorized target scope")
+    sp.add_argument("scope_action", nargs="?", default="show",
+                    choices=["show", "add", "clear"], help="default: show")
+    sp.add_argument("values", nargs="*", help="CIDRs (10.0.0.0/24) or domains (example.com)")
+    sp.set_defaults(func=cmd_scope)
+
     sp = sub.add_parser("serve", help="web console over the SQLite index")
     sp.add_argument("--host", default="127.0.0.1", help="bind address")
     sp.add_argument("--port", type=int, default=8787, help="port")
@@ -4599,6 +4696,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--templates", default=None, help="templates dir (default: <store>/../templates or SKILL dir)")
     sp.add_argument("--skip-permissions", action="store_true",
                     help="pass --dangerously-skip-permissions to the executor")
+    sp.add_argument("--no-guard", action="store_true",
+                    help="skip pre-flight scope/destructive/exfil checks")
+    sp.add_argument("--force-guard", action="store_true",
+                    help="dispatch even when the guard denies (scope/destructive)")
     sp.add_argument("--dry-run", action="store_true", help="print the rendered prompt and exit")
     sp.add_argument("--claim", action="store_true", help="(explore) claim the intent first")
     sp.add_argument("--intent", default=None, help="(verify) intent id to verify")
