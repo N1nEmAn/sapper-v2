@@ -4,7 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sapper 控制台</title>
-<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<!-- vendored: cdn.jsdelivr.net is unreachable from many CN networks, and a
+     blank console is worse than a 280 KB file in the repo. -->
+<script src="/vendor/d3.min.js"></script>
 <style>
   :root{
     --bg:#f7f7f5; --panel:#fff; --line:#e3e2dd; --text:#2c2c2a;
@@ -318,9 +320,15 @@ function renderTraffic(d) {
   const tb = document.querySelector("#ttable tbody");
   tb.innerHTML = "";
   const stats = d.stats || {total:0, hosts:0};
+  const ts = v => (v ? String(v).slice(11, 19) : "-");
   document.querySelector("#tstats").textContent = d.available === false
     ? "还没有流量记录。抓包: mitmdump -s tools/mitm_sapper.py --set sapper_store=<项目目录>"
-    : `${stats.total} 条 / ${stats.hosts} 个主机  ${stats.first || ""} .. ${stats.last || ""}`;
+    : `${stats.total} 条 · ${stats.hosts} 个主机 · ${ts(stats.first)} → ${ts(stats.last)}`;
+  document.querySelector("#s1").innerHTML = `traffic <b>${stats.total || 0}</b>`;
+  document.querySelector("#s2").innerHTML = `hosts <b>${stats.hosts || 0}</b>`;
+  document.querySelector("#s3").innerHTML =
+    `codes <b>${Object.keys(stats.by_status || {}).length}</b>`;
+  document.querySelector("#s4").innerHTML = `最近 <b>${ts(stats.last)}</b>`;
   if (d.available === false) return;
   (d.rows || []).forEach(r => {
     const tr = document.createElement("tr");
@@ -346,9 +354,12 @@ async function showTraffic(id) {
   } catch (e) { box.textContent = "加载失败: " + e; }
 }
 
-function setMode(next) {
+function setMode(next, updateHash) {
   if (mode === next) return;
   mode = next;
+  if (updateHash !== false) {
+    try { history.replaceState(null, "", "#" + next); } catch (e) { /* file:// */ }
+  }
   document.querySelectorAll("nav.tabs button").forEach(b =>
     b.classList.toggle("on", b.dataset.mode === next));
   const isTraffic = next === "traffic";
@@ -387,7 +398,15 @@ async function poll() {
 }
 
 initGraph();
-loadGraph().then(() => setTimeout(poll, 1500));
+const initial = (location.hash || "").replace("#", "");
+loadGraph().then(() => {
+  if (initial && initial !== "graph") setMode(initial, false);
+  setTimeout(poll, 1500);
+});
+window.addEventListener("hashchange", () => {
+  const next = (location.hash || "").replace("#", "");
+  if (next && next !== mode) setMode(next, false);
+});
 window.addEventListener("resize", () => { if (sim) sim.force("center",
   d3.forceCenter(svg.node().clientWidth/2, svg.node().clientHeight/2)).alpha(.3).restart(); });
 </script>

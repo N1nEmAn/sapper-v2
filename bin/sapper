@@ -9,4 +9,13 @@ if [[ -f "$ENVFILE" ]]; then
   . "$ENVFILE"
   set +a
 fi
-exec python "$HERE/sapper_win.py" "$@"
+
+# Under MSYS_NO_PATHCONV=1 (or MSYS2_ARG_CONV_EXCL=*) the script path is no
+# longer translated, so hand python a native Windows path explicitly. Without
+# this, `MSYS_NO_PATHCONV=1 sapper fact -d path=/WEB-INF/web.xml` would fail
+# before the CLI even starts.
+ENTRY="$HERE/sapper_win.py"
+if command -v cygpath >/dev/null 2>&1; then
+  ENTRY="$(cygpath -w "$ENTRY")"
+fi
+exec python "$ENTRY" "$@"

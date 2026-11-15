@@ -155,6 +155,23 @@ wsl -d sapper-ubuntu -u root -- bash /mnt/d/wsl-setup/finish.sh
 
 改源版 Dockerfile 在 `docker/Dockerfile.local`（上游 `docker/Dockerfile` 未改动）。
 
+## 6.5 Git Bash 的两个坑（Windows 专有）
+
+**坑一：POSIX 路径被改写。** 在 Git Bash 里 `sapper fact -d path=/WEB-INF/web.xml` 会把
+`/WEB-INF/web.xml` 当成路径转成 `D:/.../WEB-INF/web.xml`，数据就脏了。这是 MSYS 的行为，
+不是 sapper 的。传绝对路径类数据时关掉转换：
+
+```bash
+MSYS_NO_PATHCONV=1 sapper fact -t "web.xml" -k loot -d path=/WEB-INF/web.xml "确认可读"
+```
+
+`bin/sapper` 已用 `cygpath` 把入口路径转成 Windows 路径，所以关掉转换后启动器本身不受影响
+（早期版本会报 `can't open file 'C:\d\...'`）。用 CMD / PowerShell 没有这个问题。
+
+**坑二：控制台不能用 CDN。** `cdn.jsdelivr.net` 在国内多数网络不可达，页面会白屏。
+d3 已本地化到 `web/vendor/d3.min.js`（279 KB，随仓库分发），控制台不再依赖任何外网。
+页签支持锚点，可直接开 `http://127.0.0.1:8787/#assets` 或 `#traffic`。
+
 ## 7. 卸载
 
 ```powershell
