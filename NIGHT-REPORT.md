@@ -389,6 +389,42 @@ README 之外的硬限制：证书固定(pinning)的目标抓不到明文，这�
 
 ---
 
+## P6 已完成：控制台从"只读"变成"能干活"
+
+ARTEX 的控制台能建任务、改发现、管流量、编辑工作空间、和 agent 对话。我们此前只有一张图和
+一个确认按钮——不是缺页面，是缺**写接口**。P6 把写路径补齐：
+
+| 能力 | 接口 | UI |
+|---|---|---|
+| 建事实 | `POST /api/ops/fact` | ＋事实 表单（kind + data kv） |
+| 建意图 | `POST /api/ops/intent` | ＋意图 表单（多选来源 fact、需批准勾选） |
+| 认领/释放 | `POST /api/ops/claim|release/<id>` | intent 详情里的按钮 |
+| 完成并写产出 | `POST /api/ops/done/<id>` | 「完成…」内联表单 |
+| 批准 | `POST /api/confirm/<id>` | intent 详情里的「批准」 |
+| 派发执行 | `POST /api/ops/dispatch/<id>` | 「派发执行」+ 实时日志窗 + 停止 |
+| 搜索 | `GET /api/search?q=` | 顶部搜索，按 事实/意图/资产/流量 分组 |
+
+关键实现约束：**所有写操作都走 Store 的原方法**（`_ConsoleOps` 里只是转发），
+所以 guard、事件、索引、资产沉淀与 CLI 完全同一条路径——Web 不可能绕开守卫写图。
+
+`sapper serve` 默认仍是只读；只有 `--allow-write` 才注册 ops，且只读模式下
+`/api/ops/*` 一律 403（有回归覆盖）。
+
+### 真机验证（Chrome）
+
+```
+建 fact      -> 落盘 f011, creator=web, data.host=10.9.9.9
+意图表单     -> 来源 fact 已预选 f002
+搜索 nginx   -> 事实 2 条（f002 service / f003 vuln），点击定位到节点
+派发 i002    -> 真实执行：11 facts、7 个 service、i002 done
+日志窗       -> executor 输出实时回显
+```
+
+派发那次顺带证明了机制有效：模型发现 nmap 不存在后自行回退到 Python socket 扫描，
+并用 netstat 交叉核对 19 个端口，最后指出 `f001` 记录的 os=linux 与实测 Windows 不符。
+
+---
+
 ## 容器内验证（追加）
 
 ```
