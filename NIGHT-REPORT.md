@@ -278,15 +278,77 @@ sapper armory report w002 --vid v2 --result blocked
 
 **变体自动生成**：现在被拦三次只是标记弃用，不会自动生成新变体。要让 LLM 根据"被什么拦了"来变异（比如从 w002/v2 的被拦记录推出该换什么编码），需要 P4 里加一个 `intent.confirmation_required` 之外的触发点。
 
-## 下一步（P4 / P5）
+## P4 已完成：全局资产图（双图架构）
 
-| 期 | 内容 | 预计 |
-|---|---|---|
-| **P4** | 资产图 + 跨任务复用（ARTEX 的双图思路）| 5 小时 |
-| **P5** | MITM 流量录制（mitmproxy + traffic 表）| 4 小时 |
+sapper 原来的图是**一次性的**：打完一场就结束，下次同一家公司从头再来。P4 在它下面加了一层
+耐久资产库，形态就是 ARTEX 的「双图」——但只用了 300 行，没动 Go、没动前端框架。
 
-P4 的价值：sapper 现在的图是**一次性的**，打完一场就结束。加了全局资产库后，下次打同一家公司能接着上次的资产往下走。
+```
+~/.sapper/assets.db          ← 跨任务资产库（SQLite，全局）
+<项目>/.sapper/              ← 任务事实图（JSON，一次性的）
+        │
+        └─ fact 写入 → 事件 → 自动投影成资产（ip/domain/service/vuln/cred/loot/endpoint）
+```
+
+三个设计取舍：
+
+| 取舍 | 理由 |
+|---|---|
+| 资产是**派生**的，不是手工维护的 | 写 fact 时自动 upsert，不需要额外操作；`assets rebuild --from <dir>` 可随时回灌 |
+| 主机资产只吸收主机字段 | 否则一条 cred fact 会把 `user=admin` 写到 host 上，之后每个任务都继承这个假事实 |
+| 继承产生的是 **fact 而非 intent** | 继承值是「待复核线索」，不是已验证结论；描述里写明历史观察次数与时间 |
+
+关键守卫：`seed` 幂等。已有 `data.asset_key` 的资产不会重复继承，所以再跑一次只会补新增部分。
+
+### 命令
+
+```bash
+sapper assets                       # 列出（按最近观察倒序）
+sapper assets stats                 # 按类型统计 + 库路径
+sapper assets search example.com    # 关键词搜索（key/value/label）
+sapper assets show ip:10.0.0.5      # 单条详情（含来源 fact 列表）
+sapper assets seed --match 10.0.0 --dry-run   # 预览要继承什么
+sapper assets seed --match 10.0.0              # 继承到当前图
+sapper assets rebuild --from D://old-task       # 从历史项目回灌
+sapper assets forget ip:10.0.0.5 --all         # 删除单条 / 清空
+```
+
+### Web
+
+控制台顶部加了「任务图 / 资产图」切换。资产图用节点大小表示观察次数（`seen`），
+边是父子关系（host → service/vuln/cred），悬停看 data 与最近观察时间。
+新增接口：`GET /api/assets`、`GET /api/asset/<key>`。
+
+### 实测
+
+```
+写入 4 条 fact（host/service/vuln/cred） -> assets: 4（note 不入库）
+ip:10.0.0.5 的 data = {host, port}       -> 未被 cred 的 user 污染
+新任务 seed --match 10.0.0               -> 继承 3 项，标题为资产值
+再跑一次                                  -> 匹配 3 项，但都已在当前图中（跳过）
+edges: ip -> {service, vuln, cred}        -> 父子关系正确
+```
 
 ---
 
-晚安。明天 `git log --oneline` 就能看到所有改动。
+## 下一步（P5）
+
+| 期 | 内容 | 预计 |
+|---|---|---|
+| **P5** | MITM 流量录制（mitmproxy addon + traffic 表 + 前端流量页）| 4 小时 |
+
+P5 的三个硬点（已在 PLAN 里记过）：CA 信任、证书固定（pinning 的目标录不到）、
+流量必须先过滤再入库（否则一张表三天就爆）。
+
+---
+
+## 容器内验证（追加）
+
+```
+==== regression inside sapper-agent:latest (Linux + Python 3.14) ====
+28/28 通过
+```
+
+同一套 `tests/regress.py` 在容器里跑通，说明两条路径都成立：
+Windows 走 `bin/sapper_win.py` 的 fcntl 模拟层，Linux 走真 `fcntl.flock` + Kali 的 Python 3.14。
+（P4 之后容器内的项数变为 31，本机已验；容器下次重跑可复核。）

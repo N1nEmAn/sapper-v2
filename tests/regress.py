@@ -26,6 +26,12 @@ ROOT = Path(__file__).resolve().parent.parent
 # directly and hit the real fcntl path. Override with SAPPER_ENTRY.
 ENTRY = Path(os.environ.get("SAPPER_ENTRY", str(ROOT / "bin" / "sapper_win.py")))
 
+# Regression must never write into the operator's real asset store.
+os.environ.setdefault(
+    "SAPPER_ASSETS_DB",
+    str(Path(tempfile.gettempdir()) / f"sapper-regress-assets-{os.getpid()}.db"),
+)
+
 PASS: list[str] = []
 FAIL: list[tuple[str, str]] = []
 
@@ -616,6 +622,102 @@ def armory_errors():
 
 
 # --------------------------------------------------------------------------- #
+# assets (cross-engagement layer)
+# --------------------------------------------------------------------------- #
+def assets_env(work: Path) -> dict:
+    return {"SAPPER_ASSETS_DB": str(work / "assets.db")}
+
+
+@case("assets: fact 自动沉淀，note 不入库，host 不被 cred 污染")
+def assets_ingest():
+    work = fresh()
+    try:
+        env = assets_env(work)
+        run("fact", "-t", "边界", "-k", "host", "-d", "host=10.0.0.5", "-d", "port=8080", "x",
+            cwd=work, env=env)
+        run("fact", "-t", "Tomcat", "-k", "service", "-d", "host=10.0.0.5", "-d", "port=8080",
+            "-d", "product=tomcat", "x", cwd=work, env=env)
+        run("fact", "-t", "Ghostcat", "-k", "vuln", "-d", "cve=CVE-2020-1938",
+            "-d", "host=10.0.0.5", "x", cwd=work, env=env)
+        run("fact", "-t", "弱口令", "-k", "cred", "-d", "user=admin", "-d", "host=10.0.0.5",
+            "x", cwd=work, env=env)
+        run("fact", "-t", "随笔", "-k", "note", "不该进资产库", cwd=work, env=env)
+
+        out = run("assets", "stats", cwd=work, env=env).stdout
+        assert "assets: 4" in out, f"应有 4 个资产:\n{out}"
+        for t in ("ip", "service", "vuln", "cred"):
+            assert t in out, f"缺少资产类型 {t}:\n{out}"
+
+        import sqlite3
+        conn = sqlite3.connect(str(work / "assets.db"))
+        conn.row_factory = sqlite3.Row
+        host = conn.execute("SELECT * FROM assets WHERE key='ip:10.0.0.5'").fetchone()
+        assert host is not None, "主机资产未沉淀"
+        assert "user" not in json.loads(host["data"]), (
+            f"host 资产被 cred 的字段污染: {host['data']}"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM assets WHERE type='note'").fetchone()[0] == 0
+        conn.close()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("assets: 跨任务继承，标题取资产值，重跑幂等")
+def assets_cross_task():
+    work = fresh()
+    try:
+        env = assets_env(work)
+        run("fact", "-t", "边界", "-k", "host", "-d", "host=10.0.0.5", "x", cwd=work, env=env)
+        run("fact", "-t", "后台弱口令", "-k", "cred", "-d", "user=admin",
+            "-d", "host=10.0.0.5", "x", cwd=work, env=env)
+
+        second = work / "task2"
+        second.mkdir()
+        run("setup", "--goal", "第二个任务", cwd=second, env=env)
+
+        dry = run("assets", "seed", "--match", "10.0.0", "--dry-run", cwd=second, env=env).stdout
+        assert "dry-run" in dry and "ip:10.0.0.5" in dry, f"dry-run 未列出待继承资产:\n{dry}"
+
+        out = run("assets", "seed", "--match", "10.0.0", cwd=second, env=env).stdout
+        assert "已继承" in out, f"继承失败:\n{out}"
+
+        facts = [read_json(p) for p in sorted((second / ".sapper" / "facts").glob("f*.json"))]
+        by_kind = {f["kind"]: f for f in facts}
+        assert by_kind["host"]["title"] == "10.0.0.5", (
+            f"继承标题应为资产值，实际 {by_kind['host']['title']!r}"
+        )
+        assert by_kind["host"]["data"]["inherited"] == "true"
+        assert by_kind["cred"]["data"]["asset_key"] == "cred:admin@10.0.0.5"
+
+        again = run("assets", "seed", "--match", "10.0.0", cwd=second, env=env).stdout
+        assert "不重复继承" in again, f"重跑应跳过已继承项:\n{again}"
+        assert len(list((second / ".sapper" / "facts").glob("f*.json"))) == 2
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("assets: rebuild 可从历史项目回灌")
+def assets_rebuild():
+    work = fresh()
+    try:
+        env = assets_env(work)
+        run("fact", "-t", "a", "-k", "host", "-d", "host=192.0.2.10", "x", cwd=work, env=env)
+        run("fact", "-t", "b", "-k", "service", "-d", "host=192.0.2.10",
+            "-d", "port=443", "x", cwd=work, env=env)
+
+        # wipe, then rebuild from the engagement on disk
+        run("assets", "forget", "--all", cwd=work, env=env)
+        assert "assets: 0" in run("assets", "stats", cwd=work, env=env).stdout
+
+        out = run("assets", "rebuild", "--from", str(work), cwd=work, env=env).stdout
+        assert "2 assets" in out, f"rebuild 未回灌:\n{out}"
+        listing = run("assets", cwd=work, env=env).stdout
+        assert "192.0.2.10" in listing and "192.0.2.10:443" in listing, listing
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 @case("serve: 默认只读，POST 返回 403")
@@ -681,6 +783,7 @@ SUITES = {
     "audit": [audit_findings, audit_clean],
     "armory": [armory_basic, armory_scoring, armory_deprecate, armory_use_best,
                armory_done_link, armory_errors],
+    "assets": [assets_ingest, assets_cross_task, assets_rebuild],
     "serve": [serve_readonly],
 }
 

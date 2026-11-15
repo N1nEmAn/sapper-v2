@@ -10,6 +10,7 @@ Routes:
     GET /api/events?since=N    incremental event feed (polling)
     GET /api/fact/<id>         one fact
     GET /api/intent/<id>       one intent
+    GET /api/assets            global asset store (cross-engagement)
 """
 
 from __future__ import annotations
@@ -17,12 +18,14 @@ from __future__ import annotations
 import json
 import mimetypes
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import assets  # noqa: E402
 import index_db  # noqa: E402
 
 
@@ -106,6 +109,31 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(intent)
                         return
                 self._json({"error": "not found", "id": iid}, 404)
+                return
+
+            if route == "/api/assets":
+                qs = parse_qs(parsed.query)
+                db = assets.AssetDB()
+                if not db.available():
+                    self._json({"available": False, "assets": [], "edges": [],
+                                "stats": {"total": 0, "by_type": {}},
+                                "path": str(db.path)})
+                    return
+                limit = int((qs.get("limit") or ["400"])[0])
+                rows = db.list(type=(qs.get("type") or [None])[0],
+                               q=(qs.get("q") or [None])[0], limit=limit)
+                self._json({"available": True, "assets": rows, "edges": db.edges(),
+                            "stats": db.stats(), "path": str(db.path)})
+                return
+
+            if route.startswith("/api/asset/"):
+                key = route[len("/api/asset/"):]
+                db = assets.AssetDB()
+                row = db.get(key) if db.available() else None
+                if row is None:
+                    self._json({"error": "not found", "key": key}, 404)
+                else:
+                    self._json(row)
                 return
 
             # static assets under web/

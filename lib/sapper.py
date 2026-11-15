@@ -50,6 +50,9 @@ _UNSET = object()
 # and cross-referenced instead of buried in prose.
 FACT_KINDS = ("host", "service", "cred", "vuln", "loot", "flag", "note")
 DATA_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# Asset layer keys (global, cross-engagement). Kept here only for argparse
+# choices; lib/assets.py owns the semantics.
+ASSET_TYPES = ("ip", "domain", "service", "vuln", "cred", "loot", "endpoint")
 
 
 def normalize_fact_kind(kind: str | None) -> str | None:
@@ -190,6 +193,31 @@ def _index_event(root: Path, event: str, payload: dict) -> None:
         pass
 
 
+def _sync_assets(root: Path, payload: dict) -> None:
+    """Roll any fact in this event up into the global asset store.
+
+    Separate from the index on purpose: the index mirrors one engagement, the
+    asset store accumulates across all of them. Best-effort like the index — a
+    broken asset db must never fail a fact write.
+    """
+    try:
+        fact = payload.get("fact")
+        if not isinstance(fact, dict):
+            node = payload.get("node")
+            if isinstance(node, dict) and "kind" in node and "description" in node:
+                fact = node
+        if not isinstance(fact, dict):
+            return
+        mod = _load_lib("assets", "assets.py")
+        try:
+            root_str = str(Path(root).resolve())
+        except OSError:
+            root_str = str(root)
+        mod.ingest(fact, root=root_str)
+    except Exception:  # pragma: no cover - asset store is optional
+        pass
+
+
 def _publish_store(store, event: str, **payload) -> None:
     """Emit + index for CLI paths that write through Store directly.
 
@@ -198,6 +226,7 @@ def _publish_store(store, event: str, **payload) -> None:
     """
     _emit(event, **payload)
     _index_event(store.root, event, payload)
+    _sync_assets(store.root, payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,9 +245,10 @@ class Store:
 
     # -- events --
     def _publish(self, event: str, **payload) -> None:
-        """Notify subscribers and mirror into the optional SQLite index."""
+        """Notify subscribers, mirror into the index, roll up into assets."""
         _emit(event, **payload)
         _index_event(self.root, event, payload)
+        _sync_assets(self.root, payload)
 
     # -- existence --
     def exists(self) -> bool:
@@ -3204,6 +3234,109 @@ def cmd_audit(args) -> int:
     return 0
 
 
+def cmd_assets(args) -> int:
+    """Global asset store: what previous engagements already learned."""
+    mod = _load_lib("assets", "assets.py")
+    action = (args.assets_action or "list").lower()
+    db = mod.AssetDB()
+
+    if action in ("list", "search") and not db.available():
+        print("资产库为空。写入 fact 会自动沉淀，或用 "
+              "`sapper assets rebuild --from <项目目录>` 回灌历史。")
+        return 0
+
+    if action == "list":
+        rows = db.list(type=args.type, q=args.target, limit=args.limit)
+        if not rows:
+            print("(无匹配资产)")
+            return 0
+        for r in rows:
+            bits = [f"{r['type']:<8}", f"{r['value'][:44]:<44}", f"×{r['seen']:<3}", r["last_seen"]]
+            print("  ".join(bits))
+        print(f"-- {len(rows)} 项")
+        return 0
+
+    if action == "search":
+        if not args.target:
+            raise FGError("assets search 需要关键词，例如 sapper assets search example.com")
+        rows = db.list(q=args.target, limit=args.limit)
+        if not rows:
+            print(f"(没有匹配 {args.target!r} 的资产)")
+            return 0
+        for r in rows:
+            parent = f"  ↳{r['parent']}" if r.get("parent") else ""
+            print(f"  {r['key']:<46} ×{r['seen']:<3} {r['last_seen']}{parent}")
+        print(f"-- {len(rows)} 项")
+        return 0
+
+    if action == "show":
+        if not args.target:
+            raise FGError("assets show 需要资产 key，例如 ip:10.0.0.5")
+        row = db.get(args.target)
+        if row is None:
+            raise FGError(f"资产 {args.target} 不存在")
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+        return 0
+
+    if action == "stats":
+        st = db.stats()
+        print(f"assets: {st['total']}  {st['first_seen']} .. {st['last_seen']}")
+        if not st["total"]:
+            print("  (空)")
+        for name, count in sorted(st["by_type"].items(), key=lambda kv: -kv[1]):
+            print(f"  {name:<9} {count}")
+        print(f"db: {db.path}")
+        return 0
+
+    if action == "forget":
+        if args.all:
+            n = db.forget(None)
+            print(f"已清空资产库（{n} 项）")
+            return 0
+        if not args.target:
+            raise FGError("assets forget 需要 key，或加 --all 清空")
+        n = db.forget(args.target)
+        print(f"已删除 {n} 项：{args.target}")
+        return 0
+
+    if action == "rebuild":
+        roots = [Path(p) for p in (args.src or [])]
+        if not roots:
+            raise FGError("assets rebuild 需要 --from <项目目录>（可重复）")
+        for root in roots:
+            if not (root / ".sapper" / "facts").is_dir():
+                raise FGError(f"{root} 下没有 .sapper/facts")
+        result = mod.rebuild_from(roots)
+        print(f"scanned {result['facts_scanned']} fact-writes -> {result['assets']} assets")
+        return 0
+
+    if action == "seed":
+        if not args.match:
+            raise FGError("assets seed 需要 --match <关键词>，例如 --match example.com")
+        store = Store(Path(args.store))
+        store.require()
+        created, skipped = mod.seed_into(store, args.match, limit=args.limit,
+                                         dry_run=args.dry_run)
+        if not created:
+            if skipped:
+                print(f"匹配 {skipped} 项，但都已在当前图中（不重复继承）")
+            else:
+                print(f"(没有匹配 {args.match!r} 的历史资产)")
+            return 0
+        for item in created:
+            if item.get("dry_run"):
+                print(f"  [dry-run] {item['asset']} -> {item['kind']} / {item['title']}")
+            else:
+                print(f"  {item['id']}  {item['kind']:<8} {item['title']}")
+        tail = "（未写入）" if args.dry_run else " 已继承到当前图"
+        if skipped:
+            tail += f"，跳过 {skipped} 项已存在"
+        print(f"-- {len(created)} 项{tail}")
+        return 0
+
+    raise FGError(f"未知的 assets 动作 {action!r}；可用: list/search/show/stats/forget/rebuild/seed")
+
+
 def cmd_serve(args) -> int:
     """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
     store = Store(Path(args.store))
@@ -4945,6 +5078,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--record", action="store_true",
                     help="write a fact when findings exist")
     sp.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("assets", help="global asset store shared across engagements")
+    sp.add_argument("assets_action", nargs="?", default="list",
+                    choices=["list", "search", "show", "stats", "forget", "rebuild", "seed"],
+                    help="default: list")
+    sp.add_argument("target", nargs="?",
+                    help="keyword (list/search) or asset key (show/forget)")
+    sp.add_argument("--type", choices=list(ASSET_TYPES), help="filter by asset type (list)")
+    sp.add_argument("--limit", type=int, default=200, help="max rows (default 200)")
+    sp.add_argument("--match", help="pattern to inherit into the current graph (seed)")
+    sp.add_argument("--from", dest="src", action="append",
+                    help="project dir to re-import from (rebuild, repeatable)")
+    sp.add_argument("--all", action="store_true", help="wipe the whole store (forget)")
+    sp.add_argument("--dry-run", action="store_true", help="show what seed would create")
+    sp.set_defaults(func=cmd_assets)
 
     sp = sub.add_parser("armory", help="self-scoring weapon library")
     sp.add_argument("armory_action", nargs="?", default="list",
