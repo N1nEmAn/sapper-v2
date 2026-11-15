@@ -144,6 +144,7 @@ export function renderArmory() {
         <span class="wid">${w.id}</span>
         <span class="wname">${escapeHtml(w.name)}</span>
         <span class="wfam">${escapeHtml(w.family)}</span>
+        ${(w.cve || []).map((c) => `<em class="tag cve">${escapeHtml(c)}</em>`).join("")}
         <span class="wstat">${w.tries} 次 · 成功 ${w.ok} · 被拦 ${w.blocked}</span>
       </header>
       <div class="attrbox" id="attr-${w.id}" style="display:none"></div>

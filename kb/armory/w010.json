@@ -1,0 +1,37 @@
+{
+  "id": "w010",
+  "name": "Web 漏扫（nuclei 模板批量检测）",
+  "family": "vulnscan/web",
+  "cve": [
+    "CVE-2020-1938",
+    "CVE-2021-41773",
+    "CVE-2022-22965"
+  ],
+  "match": {
+    "vector": "web"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "nuclei 加载社区模板批量探测已知漏洞/CVE，按严重度分级",
+      "command": "nuclei -u TARGET -t cves/ -t exposures/ -t misconfig/ -severity low,medium,high,critical",
+      "sig": [
+        "nuclei",
+        "templates"
+      ],
+      "stack": [
+        "tr.ua-rotate",
+        "tr.jitter"
+      ],
+      "platform": "",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

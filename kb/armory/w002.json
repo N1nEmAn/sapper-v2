@@ -1,7 +1,7 @@
 {
   "id": "w002",
   "name": "SQL 注入联合查询探测",
-  "family": "web/sqli",
+  "family": "exploit/web-sqli",
   "match": {
     "product": "any-web"
   },

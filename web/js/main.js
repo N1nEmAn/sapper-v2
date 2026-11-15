@@ -16,6 +16,7 @@ import {
 import { loadTraffic, renderTraffic, showTraffic } from "./traffic.js";
 import { loadArmory } from "./armory.js";
 import { loadPlan } from "./plan.js";
+import { loadCve } from "./cve.js";
 import { loadChat, wireChat } from "./chat.js";
 import { wireSearch } from "./search.js";
 
@@ -73,6 +74,7 @@ function wireButtons() {
     else if (state.mode === "chat") loadChat();
     else if (state.mode === "armory") loadArmory();
     else if (state.mode === "plan") loadPlan();
+    else if (state.mode === "cve") loadCve();
     else if (isAssetMode()) refreshAssets();
     else refreshGraph();
   };
@@ -242,17 +244,18 @@ export async function setMode(next, updateHash = true) {
   $$("nav.tabs button").forEach((b) => b.classList.toggle("on", b.dataset.mode === next));
 
   const chat = next === "chat", traffic = next === "traffic", assets = next === "assets";
-  const armory = next === "armory", plan = next === "plan";
+  const armory = next === "armory", plan = next === "plan", cve = next === "cve";
   $("#chat").style.display = chat ? "flex" : "none";
   $("#traffic").style.display = traffic ? "block" : "none";
   $("#armory").style.display = armory ? "flex" : "none";
   $("#plan").style.display = plan ? "flex" : "none";
+  $("#cve").style.display = cve ? "flex" : "none";
   $("#asset-tools").classList.toggle("on", assets);
   $("#wrap").classList.toggle("with-tools", assets);
-  $("#svg").style.display = (chat || traffic || armory || plan) ? "none" : "block";
-  $("#legend").style.display = (chat || traffic || armory || plan) ? "none" : "block";
+  $("#svg").style.display = (chat || traffic || armory || plan || cve) ? "none" : "block";
+  $("#legend").style.display = (chat || traffic || armory || plan || cve) ? "none" : "block";
   $("#tip").style.display = "none";
-  if (chat || traffic || armory || plan) $("#empty").style.display = "none";
+  if (chat || traffic || armory || plan || cve) $("#empty").style.display = "none";
   $("#detail").innerHTML = `<div class="hint">点节点或搜索查看详情</div>`;
 
   if (assets) {
@@ -267,6 +270,8 @@ export async function setMode(next, updateHash = true) {
     await loadArmory();
   } else if (plan) {
     await loadPlan();
+  } else if (cve) {
+    await loadCve();
   } else {
     layoutLegend(KIND_LEGEND);
     await refreshGraph();

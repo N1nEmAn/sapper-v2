@@ -1,0 +1,34 @@
+{
+  "id": "w011",
+  "name": "Web RCE（命令注入/模板注入）",
+  "family": "exploit/web-rce",
+  "cve": [],
+  "match": {
+    "vector": "web"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "命令注入与 SSTI 模板注入探测，覆盖分号/反引号/$( ) 多种分隔",
+      "command": "探测 ;id / `id` / $(id) / {{7*7}} 等注入点，回显或时间盲注确认",
+      "sig": [
+        "command injection",
+        "ssti",
+        "{{"
+      ],
+      "stack": [
+        "tr.payload-morph",
+        "tr.jitter"
+      ],
+      "platform": "",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

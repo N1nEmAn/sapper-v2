@@ -1,7 +1,10 @@
 {
   "id": "w001",
   "name": "Tomcat AJP 文件读取 (Ghostcat)",
-  "family": "exploit/tomcat",
+  "family": "exploit/service",
+  "cve": [
+    "CVE-2020-1938"
+  ],
   "match": {
     "product": "tomcat",
     "version": "<9.0.31",

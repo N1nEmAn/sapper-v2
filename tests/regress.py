@@ -1214,6 +1214,93 @@ def plan_edges():
 
 
 # --------------------------------------------------------------------------- #
+# yamlmini (zero-dep YAML subset) + taxonomy + cve
+# --------------------------------------------------------------------------- #
+@case("yaml: 受控子集解析与 roundtrip")
+def yaml_roundtrip():
+    sys.path.insert(0, str(ROOT / "lib"))
+    from yamlmini import loads, dumps, YamlMiniError
+
+    NL = chr(10)
+    TAB = chr(9)
+    src = {
+        "id": "w001",
+        "family": "exploit/service",
+        "cve": ["CVE-2020-1938"],
+        "match": {"product": "tomcat", "version": "<9.0.31"},
+        "variants": [
+            {"vid": "v1", "command": "curl http://x/a#frag", "stack": [],
+             "stats": {"tries": 3, "ok": 1}, "confidence": 0.67},
+            {"vid": "v2", "stack": ["tr.frag", "tr.jitter"]},
+        ],
+    }
+    text = dumps(src)
+    assert loads(text) == src, f"roundtrip 失败:{NL}{text}"
+    # 注释与 URL 里带 # 不冲突
+    assert loads("note: 检查 # 注释" + NL + "url: \"http://x/a#frag\"" + NL) \
+        == {"note": "检查", "url": "http://x/a#frag"}
+    # 非法结构要拒绝
+    for bad in ("&anchor x", "k: |" + NL + "  block", "k:" + NL + TAB + "- tab"):
+        try:
+            loads(bad)
+            raise AssertionError(f"应拒绝 {bad!r}")
+        except YamlMiniError:
+            pass
+
+
+@case("taxonomy: 两段式分类合法性与描述")
+def taxonomy_ok():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import taxonomy as t
+
+    assert t.valid_family("exploit/web-rce")
+    assert t.valid_family("privesc/linux")
+    assert t.valid_family("vulnscan/web")
+    assert t.valid_family("payload/windows")    # windows 在 payload 与 privesc 下都是合法
+    assert not t.valid_family("web/sqli")       # 旧格式已废除
+    assert not t.valid_family("exploit/nonsense")
+    assert "RCE" in t.describe("exploit/web-rce")
+    assert "提权" in t.describe("privesc/windows")
+    assert "载荷" in t.describe("payload/windows")
+    assert "web-rce" in t.techniques("exploit")
+
+
+@case("cve: 种子/搜索/生成武器/武器关联回写")
+def cve_flow():
+    work = fresh()
+    try:
+        env = {**armory_env(work), "SAPPER_CVE_ROOT": str(work / "cve")}
+        n = run("cve", "seed", cwd=work, env=env)
+        assert "3" in n.stdout or "seeded" in n.stdout, n.stdout
+        run("armory", "seed", cwd=work, env=env)
+
+        listing = run("cve", "list", cwd=work, env=env).stdout
+        assert "CVE-2020-1938" in listing and "CVE-2021-41773" in listing, listing
+
+        # 从 CVE 生成武器（此时种子已灌，生成的是 w014）
+        gen = run("armory", "from-cve", "CVE-2021-41773", cwd=work, env=env).stdout
+        assert "已生成" in gen and "exploit/web-file" in gen, gen
+
+        # CVE 条目反向关联武器
+        shown = run("cve", "show", "CVE-2021-41773", cwd=work, env=env).stdout
+        assert "关联武器" in shown, shown
+
+        # 导出→导入 YAML roundtrip（w001 是 Ghostcat，family=exploit/service）
+        run("armory", "export", "w001", "--file", str(work / "w001.yaml"),
+            cwd=work, env=env)
+        imp = run("armory", "import", "--file", str(work / "w001.yaml"),
+                  cwd=work, env=env).stdout
+        assert "已导入 w001" in imp and "exploit/service" in imp, imp
+
+        # 非法 family 拒绝
+        bad = run("armory", "add", "--name", "x", "--family", "web/sqli",
+                  cwd=work, env=env, check=False)
+        assert bad.returncode != 0 and "Traceback" not in (bad.stderr or ""), bad.stderr
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 TOKEN = os.environ.setdefault("SAPPER_CONSOLE_TOKEN", "regress-token-please-change")
@@ -1493,6 +1580,7 @@ SUITES = {
     "evasion": [evasion_registry, evasion_validate, evasion_prior,
                 evasion_attribution, evasion_derive, armory_evasion_flow],
     "plan": [plan_basic, plan_sync, plan_edges],
+    "yaml": [yaml_roundtrip, taxonomy_ok, cve_flow],
     "serve": [serve_readonly, serve_write_ops],
 }
 

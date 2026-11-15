@@ -1,7 +1,7 @@
 {
   "id": "w004",
   "name": "SSRF 内网端口探测",
-  "family": "web/ssrf",
+  "family": "exploit/web-ssrf",
   "match": {
     "product": "any-web"
   },

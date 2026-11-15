@@ -52,4 +52,7 @@ export const api = {
   evasionLayers: () => getJSON("/api/evasion/layers"),
   plan: () => getJSON("/api/plan"),
   planOp: (body) => postJSON("/api/ops/plan", body),
+  cve: (q = "") => getJSON(`/api/cve${q ? `?q=${encodeURIComponent(q)}` : ""}`),
+  cveOp: (body) => postJSON("/api/ops/cve", body),
+  taxonomy: () => getJSON("/api/taxonomy"),
 };

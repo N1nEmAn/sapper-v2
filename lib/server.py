@@ -381,6 +381,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, **self.ops.plan_state()})
                 return
 
+            if route == "/api/cve":
+                if self.ops is None:
+                    self._error(403, "cve requires --allow-write")
+                    return
+                q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0]
+                self._json({"ok": True, **self.ops.cve_list(q)})
+                return
+
+            if route == "/api/taxonomy":
+                if self.ops is None:
+                    self._error(403, "taxonomy requires --allow-write")
+                    return
+                self._json({"ok": True, **self.ops.taxonomy()})
+                return
+
             if route.startswith("/api/armory/"):
                 if self.ops is None:
                     self._error(403, "armory requires --allow-write")
@@ -590,6 +605,18 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         raise ValueError(f"未知的计划动作 {sub!r}")
                     self._audit(f"plan.{sub}", str(body.get("n") or ""), True)
+                    self._json({"ok": True, **result})
+                elif action == "cve":
+                    sub = (body.get("action") or "").strip()
+                    if sub == "import":
+                        result = self.ops.cve_import(body.get("cve") or "")
+                    elif sub == "to-weapon":
+                        result = self.ops.cve_to_weapon(body.get("cve") or "")
+                    elif sub == "list":
+                        result = self.ops.cve_list(body.get("q") or "")
+                    else:
+                        raise ValueError(f"未知的 CVE 动作 {sub!r}")
+                    self._audit(f"cve.{sub}", body.get("cve") or "", True)
                     self._json({"ok": True, **result})
                 elif action == "armory":
                     sub = (body.get("action") or "").strip()

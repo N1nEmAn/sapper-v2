@@ -3079,6 +3079,23 @@ def _split_profile(args) -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
+def _link_cve_to_weapon(armory, cve_ids: list[str], wid: str) -> None:
+    """Best-effort: record the weapon on each CVE entry so the link is two-way."""
+    try:
+        cve = _load_lib("cve", "cve.py")
+        store = cve.CVEStore()
+        for cid in cve_ids:
+            entry = store.get(cid)
+            if entry is None:
+                continue
+            weapons = entry.setdefault("weapons", [])
+            if wid not in weapons:
+                weapons.append(wid)
+                store.save(entry)
+    except Exception:
+        pass    # CVE 库是辅助信息，链接失败不影响武器本体
+
+
 def _plan_step(args):
     """Step number comes either from --n or the first positional (plan set 3 done)."""
     if getattr(args, "n", None):
@@ -3175,6 +3192,136 @@ def cmd_plan(args) -> int:
         return 0
 
     raise FGError(f"unknown plan action: {action}")
+
+
+def cmd_taxonomy(args) -> int:
+    """Show the weapon taxonomy (phase/technique)."""
+    tax = _load_lib("taxonomy", "taxonomy.py")
+    action = getattr(args, "taxonomy_action", None) or "list"
+    if action == "phases":
+        for pid, desc in tax.phases().items():
+            print(f"  {pid:<12} {desc}")
+        return 0
+    if action == "techniques":
+        phase = args.target or ""
+        if phase and phase not in tax.phases():
+            raise FGError(f"未知 phase {phase!r}（{', '.join(tax.phases())}）")
+        for pid, desc in tax.phases().items():
+            if phase and pid != phase:
+                continue
+            print(f"[{pid}] {desc}")
+            for tech, tdesc in tax.techniques(pid).items():
+                print(f"    {pid}/{tech:<16} {tdesc}")
+        return 0
+    if action == "check":
+        fam = args.target or ""
+        print(f"{fam}  {'合法' if tax.valid_family(fam) else '非法'}")
+        if tax.valid_family(fam):
+            print(f"  归类: {tax.describe(fam)}")
+        return 0
+    # default: list everything
+    for pid, desc in tax.phases().items():
+        print(f"[{pid}] {desc}")
+        for tech, tdesc in tax.techniques(pid).items():
+            print(f"    {pid}/{tech:<18} {tdesc}")
+    return 0
+
+
+def cmd_cve(args) -> int:
+    """CVE knowledge base (YAML entries, pulled from CIRCL's cvelistV5 mirror)."""
+    cve = _load_lib("cve", "cve.py")
+    store = cve.CVEStore()
+    action = getattr(args, "cve_action", None) or "list"
+
+    if action == "seed":
+        n = store.seed()
+        print(f"seeded {n} CVE(s) into {store.root}")
+        return 0
+
+    if action == "list":
+        entries = store.all()
+        if not entries:
+            print(f"CVE 库为空（{store.root}）\n用 `sapper cve seed` 导入种子，或 `sapper cve import CVE-YYYY-NNNN` 在线拉取")
+            return 0
+        entries.sort(key=lambda e: e.get("published") or "", reverse=True)
+        for e in entries:
+            w = len(e.get("weapons") or [])
+            print(f"{e['id']:<17} {e.get('severity', '?'):<9} "
+                  f"{e.get('vendor', '-'):<24} {e.get('product', '-')[:22]:<22} "
+                  f"[{'/'.join(e.get('tags') or []) or '-'}]"
+                  + (f"  武器×{w}" if w else ""))
+        print(f"\n共 {len(entries)} 条，库位置 {store.root}")
+        return 0
+
+    if action == "show":
+        if not args.target:
+            raise FGError("cve show 需要 CVE 编号")
+        try:
+            entry = store.load(args.target)
+        except FileNotFoundError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"{entry['id']}  {entry.get('severity', 'UNKNOWN')}"
+              + (f"  CVSS {entry['cvss']}" if entry.get("cvss") else ""))
+        if entry.get("vendor") or entry.get("product"):
+            print(f"影响: {entry.get('vendor')}/{entry.get('product')}")
+        if entry.get("versions"):
+            print("版本: " + "; ".join(entry["versions"][:4]))
+        if entry.get("cwe"):
+            print("CWE: " + ", ".join(entry["cwe"][:4]))
+        if entry.get("tags"):
+            print("标签: " + ", ".join(entry["tags"]))
+        print()
+        print(entry.get("description", "")[:500])
+        if entry.get("weapons"):
+            print(f"\n关联武器: {', '.join(entry['weapons'])}")
+        if entry.get("references"):
+            print(f"参考: {len(entry['references'])} 条（{entry['references'][0]} ...）")
+        return 0
+
+    if action == "search":
+        if not args.target:
+            raise FGError("cve search 需要关键词")
+        hits = store.search(args.target)
+        if not hits:
+            print(f"没有匹配 {args.target!r} 的 CVE")
+            return 0
+        for e in hits:
+            print(f"{e['id']:<17} {e.get('product', '-')[:28]:<28} "
+                  f"{e.get('description', '')[:60]}")
+        return 0
+
+    if action == "import":
+        if args.file:
+            # 从本地 YAML 文件导入
+            yml = _load_lib("yamlmini", "yamlmini.py")
+            import pathlib
+            path = pathlib.Path(args.file)
+            if not path.is_file():
+                raise FGError(f"文件不存在: {path}")
+            try:
+                entry = yml.load(path)
+            except ValueError as exc:
+                raise FGError(f"YAML 解析失败: {exc}") from exc
+            if not entry.get("id") or not str(entry["id"]).startswith("CVE-"):
+                raise FGError("条目缺 id 或 id 不是 CVE 编号")
+            store.ensure()
+            store.save(entry)
+            print(f"已导入 {entry['id']}（{path}）")
+            return 0
+        if not args.target:
+            raise FGError("cve import 需要 CVE 编号或 --file x.yaml")
+        try:
+            entry = store.import_cve(args.target, source=args.source or "circl",
+                                     force=bool(args.force))
+        except (ValueError, RuntimeError) as exc:
+            raise FGError(str(exc)) from exc
+        print(f"已导入 {entry['id']}  {entry.get('product', '')}  "
+              f"[{'/'.join(entry.get('tags') or []) or '-'}]")
+        print(f"  建议武器家族: {store.guess_family(entry)}")
+        print(f"  `sapper armory from-cve {entry['id']}` 生成武器骨架")
+        return 0
+
+    raise FGError(f"unknown cve action: {action}")
 
 
 def cmd_evasion(args) -> int:
@@ -3306,6 +3453,11 @@ def cmd_armory(args) -> int:
     if action == "add":
         if not args.name:
             raise FGError("armory add 需要 --name")
+        tax = _load_lib("taxonomy", "taxonomy.py")
+        family = args.family or "misc"
+        if family != "misc" and not tax.valid_family(family):
+            raise FGError(
+                f"family {family!r} 非法（用 `sapper taxonomy` 查看合法分类）")
         variants = []
         for spec in args.variant or []:
             parts = spec.split(":", 2)
@@ -3318,10 +3470,86 @@ def cmd_armory(args) -> int:
             variants = [{"vid": "v1", "desc": "基础", "command": ""}]
         weapon = armory.add(
             name=args.name,
-            family=args.family or "misc",
+            family=family,
             variants=variants,
         )
-        print(f"{weapon['id']}  {weapon['name']}  ({len(weapon['variants'])} 个变体)")
+        if args.cve:
+            weapon["cve"] = list(args.cve)
+            armory.save(weapon)
+            _link_cve_to_weapon(armory, args.cve, weapon["id"])
+        print(f"{weapon['id']}  {weapon['name']}  [{family}]  ({len(weapon['variants'])} 个变体)")
+        return 0
+
+    if action == "import":
+        if not args.file:
+            raise FGError("armory import 需要 --file x.yaml")
+        yml = _load_lib("yamlmini", "yamlmini.py")
+        import pathlib
+        path = pathlib.Path(args.file)
+        if not path.is_file():
+            raise FGError(f"文件不存在: {path}")
+        try:
+            data = yml.load(path)
+        except ValueError as exc:
+            raise FGError(f"YAML 解析失败: {exc}") from exc
+        if not data.get("id") or not data.get("variants"):
+            raise FGError("武器 YAML 需要 id 和 variants")
+        data.setdefault("attempts", [])
+        data.setdefault("derived", [])
+        tax = _load_lib("taxonomy", "taxonomy.py")
+        fam = data.get("family") or "misc"
+        if fam != "misc" and not tax.valid_family(fam):
+            raise FGError(f"family {fam!r} 非法（`sapper taxonomy` 查看）")
+        armory.save(data)
+        if data.get("cve"):
+            _link_cve_to_weapon(armory, data["cve"], data["id"])
+        print(f"已导入 {data['id']}  [{fam}]  {len(data['variants'])} 变体")
+        return 0
+
+    if action == "export":
+        yml = _load_lib("yamlmini", "yamlmini.py")
+        import pathlib
+        if args.target:
+            try:
+                weapon = armory.load(args.target)
+            except (FileNotFoundError, ValueError) as exc:
+                raise FGError(str(exc)) from exc
+            out = yml.dumps(weapon)
+        elif args.all:
+            out = yml.dumps({"weapons": armory.all()})
+        else:
+            raise FGError("armory export 需要武器 id，或 --all 导出全部")
+        if args.file:
+            pathlib.Path(args.file).write_text(out, encoding="utf-8")
+            print(f"已导出到 {args.file}")
+        else:
+            print(out, end="")
+        return 0
+
+    if action == "from-cve":
+        if not args.target:
+            raise FGError("armory from-cve 需要 CVE 编号")
+        cve = _load_lib("cve", "cve.py")
+        store = cve.CVEStore()
+        entry = store.get(args.target)
+        if entry is None:
+            raise FGError(
+                f"本地没有 {args.target}。先 `sapper cve import {args.target}` 拉取。")
+        family = store.guess_family(entry)
+        weapon = armory.add(
+            name=(entry.get("product") or args.target) + " " + args.target,
+            family=family,
+            variants=[{"vid": "v1", "desc": (entry.get("description") or "")[:120],
+                       "command": "", "stack": []}],
+            match={"product": entry.get("product"), "vendor": entry.get("vendor"),
+                   "versions": entry.get("versions")} if entry.get("product") else {},
+        )
+        weapon["cve"] = [entry["id"]]
+        armory.save(weapon)
+        _link_cve_to_weapon(armory, [entry["id"]], weapon["id"])
+        print(f"已生成 {weapon['id']}  [{family}]  ← {entry['id']}")
+        print(f"  {weapon['name']}")
+        print(f"  变体 v1 命令为空，用 `sapper armory report/stack/derive` 补充后即可实战")
         return 0
 
     if action == "search":
@@ -3910,6 +4138,7 @@ class _ConsoleOps:
                 "id": weapon["id"],
                 "name": weapon.get("name"),
                 "family": weapon.get("family") or "misc",
+                "cve": weapon.get("cve") or [],
                 "notes": weapon.get("notes"),
                 "variants": enriched,
                 "best": best["vid"] if best else None,
@@ -4000,6 +4229,53 @@ class _ConsoleOps:
     def plan_link(self, n: int, intent_id: str) -> dict:
         plan = _load_lib("plan", "plan.py").Plan(self.store.root)
         return plan.link(n, intent_id)
+
+    def cve_list(self, keyword: str = "") -> dict:
+        cve = _load_lib("cve", "cve.py")
+        store = cve.CVEStore()
+        entries = store.all()
+        if not entries:
+            store.seed()
+            entries = store.all()
+        if keyword:
+            entries = store.search(keyword)
+        entries.sort(key=lambda e: e.get("published") or "", reverse=True)
+        return {"entries": entries, "root": str(store.root)}
+
+    def cve_import(self, cid: str) -> dict:
+        cve = _load_lib("cve", "cve.py")
+        store = cve.CVEStore()
+        try:
+            entry = store.import_cve(cid)
+        except (ValueError, RuntimeError) as exc:
+            raise FGError(str(exc)) from exc
+        return {"entry": entry, "family": store.guess_family(entry)}
+
+    def cve_to_weapon(self, cid: str) -> dict:
+        cve = _load_lib("cve", "cve.py")
+        store = cve.CVEStore()
+        entry = store.get(cid)
+        if entry is None:
+            raise FGError(f"本地没有 {cid}，先导入")
+        family = store.guess_family(entry)
+        armory = self._armory()
+        weapon = armory.add(
+            name=(entry.get("product") or cid) + " " + cid,
+            family=family,
+            variants=[{"vid": "v1", "desc": (entry.get("description") or "")[:120],
+                       "command": "", "stack": []}],
+            match={"product": entry.get("product"), "vendor": entry.get("vendor"),
+                   "versions": entry.get("versions")} if entry.get("product") else {},
+        )
+        weapon["cve"] = [entry["id"]]
+        armory.save(weapon)
+        _link_cve_to_weapon(armory, [entry["id"]], weapon["id"])
+        return {"weapon": weapon}
+
+    def taxonomy(self) -> dict:
+        tax = _load_lib("taxonomy", "taxonomy.py")
+        return {"phases": tax.phases(),
+                "techniques": {p: tax.techniques(p) for p in tax.phases()}}
 
     def armory_use(self, wid: str, vid: str | None = None,
                    profile: list[str] | None = None) -> dict:
@@ -5927,10 +6203,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("armory", help="self-scoring weapon library")
     sp.add_argument("armory_action", nargs="?", default="list",
                     choices=["list", "show", "add", "search", "use", "report", "seed",
-                             "stack", "attribute", "derive", "recommend"])
+                             "stack", "attribute", "derive", "recommend",
+                             "import", "export", "from-cve"])
     sp.add_argument("target", nargs="?", help="weapon id (or keyword for search/recommend)")
     sp.add_argument("--name", help="weapon name (add)")
-    sp.add_argument("--family", help="family, e.g. exploit/tomcat (add, list filter)")
+    sp.add_argument("--family", help="family, e.g. exploit/web-rce (add, list filter)")
+    sp.add_argument("--cve", action="append", help="CVE id (add, repeatable)")
     sp.add_argument("--variant", action="append",
                     help="vid:desc:command (add, repeatable)")
     sp.add_argument("--vid", help="variant id (use, report, stack, derive)")
@@ -5944,7 +6222,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="create the derived variant (derive); optional N = top N layers")
     sp.add_argument("--limit", type=int, default=3, help="max rows (derive/recommend)")
     sp.add_argument("--json", action="store_true", help="raw json (show)")
+    sp.add_argument("--file", help="YAML file path (import/export)")
+    sp.add_argument("--all", action="store_true", help="export all weapons / cve force")
+    sp.add_argument("--source", choices=["circl", "nvd"], default="circl",
+                    help="CVE data source (cve import)")
+    sp.add_argument("--force", action="store_true", help="re-fetch even if cached (cve import)")
     sp.set_defaults(func=cmd_armory)
+
+    sp = sub.add_parser("cve", help="CVE knowledge base (YAML, from CIRCL cvelistV5 mirror)")
+    sp.add_argument("cve_action", nargs="?", default="list",
+                    choices=["list", "show", "search", "import", "seed"])
+    sp.add_argument("target", nargs="?", help="CVE id (show/import) or keyword (search)")
+    sp.add_argument("--file", help="import from a local YAML file")
+    sp.add_argument("--source", choices=["circl", "nvd"], default="circl")
+    sp.add_argument("--force", action="store_true", help="re-fetch even if cached")
+    sp.set_defaults(func=cmd_cve)
+
+    sp = sub.add_parser("taxonomy", help="weapon taxonomy (phase/technique)")
+    sp.add_argument("taxonomy_action", nargs="?", default="list",
+                    choices=["list", "phases", "techniques", "check"])
+    sp.add_argument("target", nargs="?", help="phase (techniques) or family (check)")
+    sp.set_defaults(func=cmd_taxonomy)
 
     sp = sub.add_parser("evasion", help="evasion layer registry (混淆/加壳/不落盘/降熵…)")
     sp.add_argument("evasion_action", nargs="?", default="layers",

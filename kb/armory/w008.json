@@ -1,0 +1,33 @@
+{
+  "id": "w008",
+  "name": "Linux 提权（sudo/SUID/CVE）",
+  "family": "privesc/linux",
+  "cve": [
+    "CVE-2021-3156"
+  ],
+  "match": {
+    "os": "linux"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "sudo -l 枚举可提权命令 + SUID 二进制利用 + sudoedit 堆溢出",
+      "command": "sudo -l; find / -perm -4000 2>/dev/null; CVE-2021-3156 堆溢出 exp",
+      "sig": [
+        "sudo",
+        "suid",
+        "sudoedit"
+      ],
+      "stack": [],
+      "platform": "linux",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}
