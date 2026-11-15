@@ -805,6 +805,90 @@ def traffic_clear_guard():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@case("serve: --allow-write 时 ops 接口可写图、可搜索")
+def serve_write_ops():
+    import socket
+    import time
+    import urllib.request
+
+    work = fresh()
+    try:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        proc = subprocess.Popen(
+            [sys.executable, str(ENTRY), "serve", "--port", str(port),
+             "--rebuild", "--allow-write"],
+            cwd=str(work), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def api(path: str, body: dict | None = None) -> dict:
+            if body is None:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+            else:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+
+        try:
+            deadline = time.time() + 15
+            health = None
+            while time.time() < deadline:
+                try:
+                    health = api("/api/health")
+                    break
+                except Exception:
+                    time.sleep(0.3)
+            assert health and health.get("write") is True, "写模式未生效"
+
+            got = api("/api/ops/fact", {
+                "title": "web 建的主机", "description": "从 HTTP 接口写入",
+                "kind": "host", "data": {"host": "10.1.2.3"},
+            })
+            fid = got["fact"]["id"]
+            assert fid.startswith("f"), got
+            assert got["fact"]["creator"] == "web"
+
+            got = api("/api/ops/intent", {
+                "title": "web 建的意图", "description": "验证写接口",
+                "from": [fid], "requires_confirmation": True,
+            })
+            iid = got["intent"]["id"]
+            assert got["intent"]["status"] == "open", got
+
+            # confirmation gate must still apply through the web path
+            try:
+                api(f"/api/ops/claim/{iid}", {"worker": "web"})
+                raise AssertionError("未确认的 intent 不应允许认领")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+
+            api(f"/api/confirm/{iid}", {})
+            api(f"/api/ops/claim/{iid}", {"worker": "web"})
+            done = api(f"/api/ops/done/{iid}", {
+                "description": "首页 200", "kind": "vuln", "data": {"cve": "CVE-X"},
+            })
+            did = done["fact"]["id"]
+            assert did != fid, done
+            assert done["intent"]["status"] == "done"
+
+            found = api("/api/search?q=10.1.2.3")
+            assert any(f["id"] == fid for f in found["facts"]), found
+
+            on_disk = read_json(work / ".sapper" / "facts" / f"{did}.json")
+            assert on_disk["data"]["cve"] == "CVE-X"
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
@@ -847,14 +931,17 @@ def serve_readonly():
                 ) as resp:
                     assert resp.status == 200, f"{route} 应返回 200"
 
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/api/confirm/i001", method="POST"
-            )
-            try:
-                urllib.request.urlopen(req, timeout=5)
-                raise AssertionError("只读模式应拒绝 POST")
-            except urllib.error.HTTPError as exc:
-                assert exc.code == 403, f"应返回 403，实际 {exc.code}"
+            for path, body in (("/api/confirm/i001", None), ("/api/ops/fact", {"description": "x"})):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{path}",
+                    data=b"{}" if body is None else json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=5)
+                    raise AssertionError(f"只读模式应拒绝 POST {path}")
+                except urllib.error.HTTPError as exc:
+                    assert exc.code == 403, f"{path} 应返回 403，实际 {exc.code}"
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -879,7 +966,7 @@ SUITES = {
                armory_done_link, armory_errors],
     "assets": [assets_ingest, assets_cross_task, assets_rebuild],
     "traffic": [traffic_filter, traffic_query, traffic_clear_guard],
-    "serve": [serve_readonly],
+    "serve": [serve_readonly, serve_write_ops],
 }
 
 

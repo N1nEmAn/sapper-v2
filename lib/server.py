@@ -35,6 +35,7 @@ class Handler(BaseHTTPRequestHandler):
     db_path: Path | None = None
     web_root: Path | None = None
     confirm_cb = None
+    ops = None
 
     def log_message(self, fmt: str, *args) -> None:  # keep the console quiet
         return
@@ -43,6 +44,22 @@ class Handler(BaseHTTPRequestHandler):
     def _db(self) -> "index_db.IndexDB":
         assert self.db_path is not None
         return index_db.IndexDB(self.db_path)
+
+    def _body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not length:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"请求体不是合法 JSON: {exc}")
+        if not isinstance(parsed, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return parsed
 
     def _json(self, payload: object, code: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode()
@@ -81,7 +98,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if route == "/api/health":
                 graph = self._db().graph()
-                self._json({"ok": True, "stats": graph["stats"], "seq": self._db().last_seq()})
+                self._json({"ok": True, "stats": graph["stats"], "seq": self._db().last_seq(),
+                            "write": self.ops is not None})
                 return
 
             if route == "/api/graph":
@@ -166,6 +184,25 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(rec)
                 return
 
+            if route == "/api/search":
+                qs = parse_qs(parsed.query)
+                q = (qs.get("q") or [""])[0]
+                limit = int((qs.get("limit") or ["40"])[0])
+                if self.ops is None:
+                    self._json({"q": q, "error": "search requires --allow-write",
+                                "facts": [], "intents": [], "assets": [], "traffic": []})
+                    return
+                self._json(self.ops.search(q, limit))
+                return
+
+            if route.startswith("/api/ops/dispatch/"):
+                iid = route.rsplit("/", 1)[-1]
+                if self.ops is None:
+                    self._json({"error": "write disabled (start with --allow-write)"}, 403)
+                    return
+                self._json(self.ops.dispatch_status(iid))
+                return
+
             # static assets under web/
             if self.web_root is not None:
                 candidate = (self.web_root / route.lstrip("/")).resolve()
@@ -196,17 +233,47 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, 400)
             return
 
+        if route.startswith("/api/ops/"):
+            if self.ops is None:
+                self._json({"error": "write disabled (start with --allow-write)"}, 403)
+                return
+            parts = route[len("/api/ops/"):].split("/")
+            action = parts[0]
+            target = parts[1] if len(parts) > 1 else ""
+            try:
+                body = self._body()
+                if action == "fact":
+                    self._json({"ok": True, "fact": self.ops.fact(body)})
+                elif action == "intent":
+                    self._json({"ok": True, "intent": self.ops.intent(body)})
+                elif action == "claim" and target:
+                    self._json({"ok": True, "intent": self.ops.claim(target, body)})
+                elif action == "release" and target:
+                    self._json({"ok": True, "intent": self.ops.release(target, body)})
+                elif action == "done" and target:
+                    self._json({"ok": True, **self.ops.done(target, body)})
+                elif action == "dispatch" and target:
+                    self._json({"ok": True, **self.ops.dispatch(target, body)})
+                elif action == "dispatch_stop" and target:
+                    self._json(self.ops.dispatch_stop(target))
+                else:
+                    self._json({"error": f"unknown op {action!r}"}, 404)
+            except Exception as exc:
+                self._json({"error": str(exc)}, 400)
+            return
+
         self._json({"error": "not found"}, 404)
 
 
 class Console:
     def __init__(self, db_path: Path, web_root: Path, host: str = "127.0.0.1",
-                 port: int = 8787, confirm_cb=None):
+                 port: int = 8787, confirm_cb=None, ops=None):
         self.db_path = db_path
         self.web_root = web_root
         self.host = host
         self.port = port
         self.confirm_cb = confirm_cb
+        self.ops = ops
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -220,6 +287,7 @@ class Console:
                 "db_path": self.db_path,
                 "web_root": self.web_root,
                 "confirm_cb": staticmethod(self.confirm_cb) if self.confirm_cb else None,
+                "ops": staticmethod(self.ops) if self.ops else None,
             },
         )
         return ThreadingHTTPServer((self.host, self.port), handler)

@@ -30,6 +30,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -3411,6 +3412,162 @@ def cmd_traffic(args) -> int:
     raise FGError(f"未知的 traffic 动作 {action!r}；可用: list/search/show/stats/clear/import")
 
 
+class _ConsoleOps:
+    """Write operations the web console is allowed to perform.
+
+    The HTTP layer stays dumb: it parses JSON and calls these methods. Keeping
+    the store work here means every console action goes through exactly the
+    same code path as the CLI (guard, events, index, assets), so the web can
+    never drift from the CLI's semantics.
+    """
+
+    def __init__(self, store: Store, index_db):
+        self.store = store
+        self.index = index_db
+        self.runs: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    # -- graph writes -------------------------------------------------------
+    def fact(self, body: dict) -> dict:
+        fact = self.store.add_fact(
+            description=(body.get("description") or "").strip(),
+            creator=body.get("creator") or "web",
+            title=body.get("title") or None,
+            doc=body.get("doc") or None,
+            kind=body.get("kind") or None,
+            data=parse_kv_pairs(body.get("data_pairs")) if body.get("data_pairs")
+            else (body.get("data") or None),
+        )
+        return fact
+
+    def intent(self, body: dict) -> dict:
+        from_ids = body.get("from") or []
+        if isinstance(from_ids, str):
+            from_ids = [x.strip() for x in from_ids.split(",") if x.strip()]
+        if not from_ids:
+            raise FGError("intent 需要至少一个来源 fact（from）")
+        return self.store.add_intent(
+            from_ids=from_ids,
+            description=(body.get("description") or "").strip(),
+            creator=body.get("creator") or "web",
+            requires_confirmation=bool(body.get("requires_confirmation")),
+            title=body.get("title") or None,
+            doc=body.get("doc") or None,
+        )
+
+    def claim(self, iid: str, body: dict) -> dict:
+        return self.store.claim_intent(iid, body.get("worker") or "web")
+
+    def release(self, iid: str, body: dict) -> dict:
+        return self.store.release_intent(iid, body.get("worker") or "web")
+
+    def done(self, iid: str, body: dict) -> dict:
+        fact, intent = self.store.conclude_with_new_fact(
+            iid,
+            description=(body.get("description") or "").strip(),
+            worker=body.get("worker") or "web",
+            title=body.get("title") or None,
+            doc=body.get("doc") or None,
+            kind=body.get("kind") or None,
+            data=body.get("data") or None,
+        )
+        return {"fact": fact, "intent": intent}
+
+    # -- executor -----------------------------------------------------------
+    def _entry(self) -> Path:
+        here = Path(__file__).resolve()
+        if os.name == "nt":
+            return here.parent.parent / "bin" / "sapper_win.py"
+        return here
+
+    def dispatch(self, iid: str, body: dict) -> dict:
+        intent = self.store.get_intent(iid)
+        if intent["to"] is not None:
+            raise FGError(f"{iid} 已完成，不能再派发")
+        with self._lock:
+            state = self.runs.get(iid)
+            if state and state["proc"].poll() is None:
+                raise FGError(f"{iid} 正在执行中（pid {state['proc'].pid}）")
+
+            runs_dir = self.store.root / "runs"
+            runs_dir.mkdir(exist_ok=True)
+            log_path = runs_dir / f"{iid}.log"
+            cmd = [sys.executable, str(self._entry()), "--store", str(self.store.root),
+                   "dispatch", iid]
+            if body.get("skip_permissions"):
+                cmd.append("--skip-permissions")
+            if body.get("model"):
+                cmd += ["--model", str(body["model"])]
+            log = log_path.open("w", encoding="utf-8", errors="replace")
+            log.write(f"$ {' '.join(cmd)}\n\n")
+            log.flush()
+            proc = subprocess.Popen(
+                cmd, cwd=str(self.store.root.parent), stdout=log,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            self.runs[iid] = {"proc": proc, "log": str(log_path),
+                              "started_at": now_iso(), "log_handle": log}
+        return {"id": iid, "pid": proc.pid, "log": str(log_path)}
+
+    def dispatch_status(self, iid: str) -> dict:
+        state = self.runs.get(iid)
+        if not state:
+            return {"running": False, "known": False}
+        rc = state["proc"].poll()
+        tail = ""
+        try:
+            text = Path(state["log"]).read_text(encoding="utf-8", errors="replace")
+            tail = text[-4000:]
+        except OSError:
+            pass
+        return {"running": rc is None, "known": True, "returncode": rc,
+                "started_at": state["started_at"], "log": state["log"], "tail": tail}
+
+    def dispatch_stop(self, iid: str) -> dict:
+        state = self.runs.get(iid)
+        if not state or state["proc"].poll() is not None:
+            return {"ok": False, "reason": "未在运行"}
+        state["proc"].terminate()
+        return {"ok": True}
+
+    # -- search -------------------------------------------------------------
+    def search(self, q: str, limit: int = 40) -> dict:
+        q = (q or "").strip()
+        if not q:
+            return {"q": q, "facts": [], "intents": [], "assets": [], "traffic": []}
+        needle = q.lower()
+
+        def hit(*fields) -> bool:
+            return any(needle in str(f or "").lower() for f in fields)
+
+        facts = [f for f in self.store.list_facts()
+                 if hit(f.get("id"), f.get("title"), f.get("description"),
+                        f.get("doc"), json.dumps(f.get("data") or {}, ensure_ascii=False))][:limit]
+        intents = [i for i in self.store.list_intents()
+                   if hit(i.get("id"), i.get("title"), i.get("description"),
+                          i.get("doc"))][:limit]
+
+        assets: list[dict] = []
+        try:
+            assets_mod = _load_lib("assets", "assets.py")
+            assets = assets_mod.AssetDB().list(q=q, limit=limit)
+        except Exception:
+            pass
+
+        traffic: list[dict] = []
+        try:
+            traffic_mod = _load_lib("traffic", "traffic.py")
+            ts = traffic_mod.TrafficStore(self.store.root)
+            if ts.available():
+                traffic = ts.list(q=q, limit=limit)
+        except Exception:
+            pass
+
+        return {"q": q, "facts": facts, "intents": intents,
+                "assets": assets, "traffic": traffic}
+
+
 def cmd_serve(args) -> int:
     """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
     store = Store(Path(args.store))
@@ -3444,14 +3601,17 @@ def cmd_serve(args) -> int:
         raise FGError(f"web console not found under {web_root}")
 
     confirm_cb = None
+    ops = None
     if getattr(args, "allow_write", False):
         def confirm_cb(iid: str) -> None:
             intent = store.confirm_intent(iid)
             print(f"confirmed {intent['id']} via web console", file=sys.stderr)
-        print("write enabled: POST /api/confirm/<id> is allowed (127.0.0.1 only)")
+        ops = _ConsoleOps(store, mod)
+        print("write enabled: POST /api/ops/* (fact/intent/claim/release/done/dispatch)")
+        print("              POST /api/confirm/<id>       (approve an intent)")
 
     srv_mod = _load_lib("server", "server.py")
-    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb)
+    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb, ops)
     try:
         console.serve_forever()
     except KeyboardInterrupt:
@@ -3640,9 +3800,21 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
     title, desc, doc, kind, fdata = _parse_explore_payload(payload)
     # record the produced fact AND link the intent atomically — no orphan fact
     # if a concurrent executor already concluded this intent (review C1/H1).
-    fact, intent = store.conclude_with_new_fact(
-        intent["id"], desc, worker, title=title, doc=doc, kind=kind, data=fdata,
-    )
+    try:
+        fact, intent = store.conclude_with_new_fact(
+            intent["id"], desc, worker, title=title, doc=doc, kind=kind, data=fdata,
+        )
+    except FGError as exc:
+        # The executor itself may have closed the intent (templates tell it to).
+        # That is the happy path for an autonomous worker, not a failure: report
+        # what it wrote instead of exiting non-zero.
+        if "already concluded" not in str(exc):
+            raise
+        current = store.get_intent(intent["id"])
+        existing = store.get_fact(current["to"])
+        print(f"[explore] {intent['id']} concluded by executor -> "
+              f"{existing['id']}: {existing['description'][:120]}")
+        return 0
     print(f"[explore] {intent['id']} -> {fact['id']}: {desc}")
     return 0
 
