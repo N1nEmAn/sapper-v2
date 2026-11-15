@@ -31,6 +31,10 @@ os.environ.setdefault(
     "SAPPER_ASSETS_DB",
     str(Path(tempfile.gettempdir()) / f"sapper-regress-assets-{os.getpid()}.db"),
 )
+os.environ.setdefault(
+    "SAPPER_ARMORY_ROOT",
+    str(Path(tempfile.gettempdir()) / f"sapper-regress-armory-{os.getpid()}"),
+)
 
 PASS: list[str] = []
 FAIL: list[tuple[str, str]] = []
@@ -1127,6 +1131,45 @@ def serve_write_ops():
             # 写会话不能直接执行：没有 --allow-exec 时派发 403
             code, _ = http_call(port, "POST", f"/api/ops/dispatch/{iid}", {}, headers=AUTH)
             assert code == 403, code
+
+            # 武器库：自动 seed、记分、弃用、自动选优、新建
+            arm = json.loads(http_call(port, "GET", "/api/armory", headers=AUTH)[1])
+            assert len(arm["weapons"]) >= 4, arm
+            codes = []
+            for _ in range(3):
+                r = json.loads(http_call(port, "POST", "/api/ops/armory", {
+                    "action": "report", "weapon": "w002", "vid": "v2",
+                    "result": "blocked"}, headers=AUTH)[1])
+                codes.append(r["confidence"])
+            assert codes == sorted(codes, reverse=True) and codes[-1] < codes[0], codes
+            assert r["deprecated"] is True, r
+
+            use = json.loads(http_call(port, "POST", "/api/ops/armory", {
+                "action": "use", "weapon": "w002"}, headers=AUTH)[1])
+            assert use["variant"] != "v2", use
+            assert use["command"], use
+
+            added = json.loads(http_call(port, "POST", "/api/ops/armory", {
+                "action": "add", "name": "回归武器", "family": "test/regress",
+                "variants": [{"vid": "v1", "command": "echo hi"}]}, headers=AUTH)[1])
+            assert added["weapon"]["id"].startswith("w"), added
+
+            # 完成意图时记分；无效变体必须在写图前被拒
+            iid2 = json.loads(http_call(port, "POST", "/api/ops/intent", {
+                "description": "记分用", "from": [fid]}, headers=AUTH)[1])["intent"]["id"]
+            scored = json.loads(http_call(port, "POST", f"/api/ops/done/{iid2}", {
+                "description": "产出一条", "kind": "note",
+                "weapon": "w002", "vid": "v3", "result": "ok"}, headers=AUTH)[1])
+            assert scored["weapon"]["confidence"] > 0.5, scored
+
+            iid3 = json.loads(http_call(port, "POST", "/api/ops/intent", {
+                "description": "非法变体用", "from": [fid]}, headers=AUTH)[1])["intent"]["id"]
+            code, _ = http_call(port, "POST", f"/api/ops/done/{iid3}", {
+                "description": "x", "weapon": "w002", "vid": "v99", "result": "ok"},
+                headers=AUTH)
+            assert code == 400, code
+            still = read_json(work / ".sapper" / "intents" / f"{iid3}.json")
+            assert still["to"] is None and still["status"] == "open", still
 
             # 审计日志：每次写操作留痕且带哈希链
             lines = (work / ".sapper" / "audit.jsonl").read_text(encoding="utf-8").splitlines()

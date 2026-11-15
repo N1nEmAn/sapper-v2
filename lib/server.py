@@ -139,6 +139,13 @@ class Handler(BaseHTTPRequestHandler):
                 and (parsed.hostname or "") in {"127.0.0.1", "localhost", "::1"}
                 and (parsed.port or 80) == self.port)
 
+    def _is_navigation(self) -> bool:
+        """Top-level page loads are not data access: let them through so the
+        token prompt can be shown. SameSite=Strict already keeps its cookies
+        away from cross-site navigations."""
+        mode = (self.headers.get("Sec-Fetch-Mode") or "").lower()
+        return mode == "navigate" or "text/html" in (self.headers.get("Accept") or "")
+
     def _presented_token(self) -> str:
         auth = self.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
@@ -238,7 +245,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             self._error(421, "Host 不在允许列表（仅 127.0.0.1 / localhost）")
             return
-        if not self._origin_ok():
+        # Page loads are not data access: a cross-site *navigation* gets the
+        # token prompt, never data (SameSite=Strict keeps the cookie away).
+        if not self._is_navigation() and not self._origin_ok():
             self._error(403, "跨站请求被拒绝")
             return
 
@@ -336,6 +345,26 @@ class Handler(BaseHTTPRequestHandler):
                 rec = store.get(int(raw)) if raw.isdigit() and store.available() else None
                 self._json(rec if rec is not None else {"error": "not found", "id": raw},
                            200 if rec is not None else 404)
+                return
+
+            if route == "/api/armory":
+                if self.ops is None:
+                    self._error(403, "armory requires --allow-write")
+                    return
+                self._json({"ok": True, **self.ops.armory_list()})
+                return
+
+            if route.startswith("/api/armory/"):
+                if self.ops is None:
+                    self._error(403, "armory requires --allow-write")
+                    return
+                wid = route.rsplit("/", 1)[-1]
+                weapon = next((w for w in self.ops.armory_list()["weapons"]
+                               if w["id"] == wid), None)
+                if weapon is None:
+                    self._json({"error": "not found", "id": wid}, 404)
+                else:
+                    self._json({"ok": True, "weapon": weapon})
                 return
 
             if route == "/api/chat":
@@ -506,6 +535,23 @@ class Handler(BaseHTTPRequestHandler):
                     result = self.ops.dispatch_stop(target)
                     self._audit("executor.stop", target, bool(result.get("ok")))
                     self._json(result)
+                elif action == "armory":
+                    sub = (body.get("action") or "").strip()
+                    if sub == "use":
+                        result = self.ops.armory_use(body.get("weapon") or "",
+                                                     body.get("vid") or None)
+                    elif sub == "report":
+                        result = self.ops.armory_report(
+                            body.get("weapon") or "", body.get("vid") or "",
+                            body.get("result") or "ok")
+                    elif sub == "add":
+                        result = self.ops.armory_add(body)
+                    elif sub == "seed":
+                        result = self.ops.armory_seed()
+                    else:
+                        raise ValueError(f"未知的武器库动作 {sub!r}")
+                    self._audit(f"armory.{sub}", body.get("weapon") or "", True)
+                    self._json({"ok": True, **result})
                 elif action == "assets":
                     result = self.ops.asset_action(body.get("action") or "",
                                                    body.get("key") or "")

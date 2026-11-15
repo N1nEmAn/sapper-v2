@@ -162,6 +162,11 @@ class Armory:
                 stats["fail"] = stats.get("fail", 0) + 1
                 variant["streak_fail"] = variant.get("streak_fail", 0) + 1
             variant["confidence"] = confidence(stats["ok"], stats["tries"])
+            # keep a short trail so the console can show the curve, not just a number
+            trail = variant.setdefault("history", [])
+            trail.append({"ts": _now(), "result": result,
+                          "conf": variant["confidence"]})
+            variant["history"] = trail[-24:]
             if variant.get("streak_fail", 0) >= STREAK_LIMIT:
                 variant["deprecated"] = True
             self.save(weapon)

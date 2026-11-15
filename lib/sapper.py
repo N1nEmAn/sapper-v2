@@ -3462,6 +3462,14 @@ class _ConsoleOps:
         return self.store.release_intent(iid, body.get("worker") or "web")
 
     def done(self, iid: str, body: dict) -> dict:
+        weapon = (body.get("weapon") or "").strip()
+        vid = (body.get("vid") or "").strip()
+        if weapon:
+            # validate before touching the graph: a typo must not leave the
+            # intent concluded but unscored
+            if not vid:
+                raise FGError("记录武器战绩需要同时指定变体 vid")
+            self.armory_use(weapon, vid)
         fact, intent = self.store.conclude_with_new_fact(
             iid,
             description=(body.get("description") or "").strip(),
@@ -3471,7 +3479,13 @@ class _ConsoleOps:
             kind=body.get("kind") or None,
             data=body.get("data") or None,
         )
-        return {"fact": fact, "intent": intent}
+        score = None
+        if weapon:
+            try:
+                score = self.armory_report(weapon, vid, body.get("result") or "ok")
+            except Exception as exc:  # best-effort: the conclusion already happened
+                print(f"[armory] 记分失败（fact 已写入）: {exc}", file=sys.stderr)
+        return {"fact": fact, "intent": intent, "weapon": score}
 
     # -- executor -----------------------------------------------------------
     def _entry(self) -> Path:
@@ -3530,6 +3544,86 @@ class _ConsoleOps:
             return {"ok": False, "reason": "未在运行"}
         state["proc"].terminate()
         return {"ok": True}
+
+    # -- armory -------------------------------------------------------------
+    def _armory(self):
+        return _load_lib("armory", "armory.py").Armory()
+
+    def armory_list(self) -> dict:
+        armory = self._armory()
+        weapons = armory.all()
+        if not weapons:                     # fresh install: make the UI useful
+            armory.seed()
+            weapons = armory.all()
+        out = []
+        for weapon in weapons:
+            variants = weapon.get("variants") or []
+            best = armory.best_variant(weapon)
+            stats = [v.get("stats") or {} for v in variants]
+            out.append({
+                "id": weapon["id"],
+                "name": weapon.get("name"),
+                "family": weapon.get("family") or "misc",
+                "notes": weapon.get("notes"),
+                "variants": variants,
+                "best": best["vid"] if best else None,
+                "tries": sum(s.get("tries", 0) for s in stats),
+                "ok": sum(s.get("ok", 0) for s in stats),
+                "blocked": sum(s.get("blocked", 0) for s in stats),
+                "deprecated": sum(1 for v in variants if v.get("deprecated")),
+            })
+        out.sort(key=lambda w: (-(w["ok"] / w["tries"] if w["tries"] else 0), w["id"]))
+        return {"weapons": out, "root": str(armory.root)}
+
+    def armory_use(self, wid: str, vid: str | None = None) -> dict:
+        armory = self._armory()
+        weapon = armory.load(wid)
+        if vid:
+            chosen = next((v for v in weapon["variants"] if v["vid"] == vid), None)
+            if chosen is None:
+                raise FGError(f"{wid} 没有变体 {vid}")
+        else:
+            chosen = armory.best_variant(weapon)
+            if chosen is None:
+                raise FGError(f"{wid} 的所有变体都已弃用")
+        return {"weapon": wid, "variant": chosen["vid"],
+                "command": chosen.get("command") or "",
+                "desc": chosen.get("desc") or "",
+                "confidence": chosen.get("confidence", 0.5),
+                "deprecated": bool(chosen.get("deprecated"))}
+
+    def armory_report(self, wid: str, vid: str, result: str) -> dict:
+        armory = self._armory()
+        weapon = armory.report(wid, vid, result)
+        variant = next(v for v in weapon["variants"] if v["vid"] == vid)
+        return {"weapon": wid, "variant": vid,
+                "confidence": variant.get("confidence", 0.5),
+                "deprecated": bool(variant.get("deprecated")),
+                "stats": variant.get("stats") or {},
+                "best": (armory.best_variant(weapon) or {}).get("vid")}
+
+    def armory_add(self, body: dict) -> dict:
+        armory = self._armory()
+        variants = body.get("variants") or []
+        if not isinstance(variants, list) or not variants:
+            raise FGError("新建武器至少需要一个变体")
+        clean = []
+        for item in variants:
+            if not isinstance(item, dict) or not (item.get("command") or "").strip():
+                raise FGError("每个变体必须有 command")
+            clean.append({
+                "vid": (item.get("vid") or f"v{len(clean) + 1}").strip(),
+                "desc": (item.get("desc") or "").strip(),
+                "command": item["command"].strip(),
+                "sig": item.get("sig") or [],
+            })
+        weapon = armory.add(name=(body.get("name") or "").strip(),
+                            family=(body.get("family") or "misc").strip(),
+                            variants=clean)
+        return {"weapon": weapon}
+
+    def armory_seed(self) -> dict:
+        return {"seeded": self._armory().seed()}
 
     # -- asset layer --------------------------------------------------------
     def asset_action(self, action: str, key: str) -> dict:

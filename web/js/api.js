@@ -43,4 +43,6 @@ export const api = {
   dispatchStatus: (id) => getJSON(`/api/ops/dispatch/${id}`),
   stopDispatch: (id) => postJSON(`/api/ops/dispatch_stop/${id}`, {}),
   assetAction: (action, key) => postJSON("/api/ops/assets", { action, key }),
+  armory: () => getJSON("/api/armory"),
+  armoryOp: (body) => postJSON("/api/ops/armory", body),
 };

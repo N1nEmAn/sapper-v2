@@ -14,6 +14,7 @@ import {
   filteredAssetData, toggleLayout,
 } from "./assets.js";
 import { loadTraffic, renderTraffic, showTraffic } from "./traffic.js";
+import { loadArmory } from "./armory.js";
 import { loadChat, wireChat } from "./chat.js";
 import { wireSearch } from "./search.js";
 
@@ -69,6 +70,7 @@ function wireButtons() {
   $("#btn-refresh").onclick = () => {
     if (state.mode === "traffic") loadTraffic();
     else if (state.mode === "chat") loadChat();
+    else if (state.mode === "armory") loadArmory();
     else if (isAssetMode()) refreshAssets();
     else refreshGraph();
   };
@@ -238,14 +240,16 @@ export async function setMode(next, updateHash = true) {
   $$("nav.tabs button").forEach((b) => b.classList.toggle("on", b.dataset.mode === next));
 
   const chat = next === "chat", traffic = next === "traffic", assets = next === "assets";
+  const armory = next === "armory";
   $("#chat").style.display = chat ? "flex" : "none";
   $("#traffic").style.display = traffic ? "block" : "none";
+  $("#armory").style.display = armory ? "flex" : "none";
   $("#asset-tools").classList.toggle("on", assets);
   $("#wrap").classList.toggle("with-tools", assets);
-  $("#svg").style.display = (chat || traffic) ? "none" : "block";
-  $("#legend").style.display = (chat || traffic) ? "none" : "block";
+  $("#svg").style.display = (chat || traffic || armory) ? "none" : "block";
+  $("#legend").style.display = (chat || traffic || armory) ? "none" : "block";
   $("#tip").style.display = "none";
-  if (chat || traffic) $("#empty").style.display = "none";
+  if (chat || traffic || armory) $("#empty").style.display = "none";
   $("#detail").innerHTML = `<div class="hint">点节点或搜索查看详情</div>`;
 
   if (assets) {
@@ -256,6 +260,8 @@ export async function setMode(next, updateHash = true) {
     await loadTraffic();
   } else if (chat) {
     await loadChat();
+  } else if (armory) {
+    await loadArmory();
   } else {
     layoutLegend(KIND_LEGEND);
     await refreshGraph();

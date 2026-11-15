@@ -200,19 +200,58 @@ function openDoneForm(iid) {
       <select id="d-kind">${FACTS_KINDS.map((k) => `<option>${k}</option>`).join("")}</select>
       <label>data（每行 key=value）</label>
       <textarea id="d-data"></textarea>
+      <label>武器战绩（可选，计入置信度）</label>
+      <div class="mrow" style="margin-top:0">
+        <select id="d-weapon" style="flex:1"><option value="">不记分</option></select>
+        <select id="d-vid"><option value="">变体</option></select>
+        <select id="d-result">
+          <option value="ok">成功</option><option value="blocked">被拦</option>
+          <option value="fail">失败</option>
+        </select>
+      </div>
       <div class="mrow"><button class="act pri" id="dd-save">完成并记录</button>
       <button class="act" id="dd-cancel">取消</button></div>
     </div>`;
+
+  // lazily populate the armory pickers; failing to load must not block the form
+  api.armory().then((d) => {
+    const sel = $("#d-weapon");
+    if (!sel) return;
+    (d.weapons || []).forEach((w) => {
+      const opt = document.createElement("option");
+      opt.value = w.id;
+      opt.textContent = `${w.id} ${w.name}`;
+      opt.dataset.variants = JSON.stringify((w.variants || []).map((v) => v.vid));
+      sel.appendChild(opt);
+    });
+    sel.onchange = () => {
+      const vid = $("#d-vid");
+      vid.innerHTML = `<option value="">变体</option>`;
+      const chosen = sel.selectedOptions[0];
+      const list = chosen && chosen.dataset.variants ? JSON.parse(chosen.dataset.variants) : [];
+      list.forEach((v) => {
+        const o = document.createElement("option");
+        o.value = v; o.textContent = v;
+        vid.appendChild(o);
+      });
+    };
+  }).catch(() => {});
   $("#dd-cancel").onclick = () => emit("deselect");
   $("#dd-save").onclick = async () => {
+    const weapon = $("#d-weapon") ? $("#d-weapon").value : "";
+    const vid = $("#d-vid") ? $("#d-vid").value : "";
+    if (weapon && !vid) { toast("选了武器就要选变体（用于记分）"); return; }
     try {
-      const d = await api.done(iid, {
+      const body = {
         description: $("#d-desc").value,
         kind: $("#d-kind").value,
         data: parseKv($("#d-data").value),
         worker: "web",
-      });
-      toast(`${iid} → ${d.fact.id}`);
+      };
+      if (weapon) Object.assign(body, { weapon, vid, result: $("#d-result").value });
+      const d = await api.done(iid, body);
+      const score = d.weapon ? ` · ${weapon}/${vid} 置信度 ${Number(d.weapon.confidence).toFixed(2)}` : "";
+      toast(`${iid} → ${d.fact.id}${score}`);
       emit("reloadAndSelect", d.fact.id);
     } catch (e) { toast("失败: " + e.message); }
   };
