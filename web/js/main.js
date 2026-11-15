@@ -51,6 +51,7 @@ async function init() {
   await refreshHealth();
   await refreshGraph();
   applyHash(true);
+  connectStream();
   setInterval(poll, 2000);
   setInterval(() => { if (state.mode === "assets") refreshAssets(); }, 8000);
   window.addEventListener("resize", () => view.resize());
@@ -279,6 +280,24 @@ window.addEventListener("hashchange", () => applyHash(false));
 // ------------------------------------------------------------------ //
 // polling
 // ------------------------------------------------------------------ //
+// Real-time feed. EventSource reconnects on its own; polling below stays as a
+// fallback for the views that do not use the event stream.
+let stream = null;
+function connectStream() {
+  if (stream) stream.close();
+  stream = new EventSource(`/api/stream?since=${lastSeq}`);
+  stream.onmessage = async (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (e) { return; }
+    if (!d.events || !d.events.length) return;
+    lastSeq = d.last;
+    pushEvents(d.events);
+    $("#s4").innerHTML = `seq <b>${lastSeq}</b>`;
+    if (state.mode === "graph") await refreshGraph();
+  };
+  stream.onerror = () => { /* browser retries; if it gives up we keep polling */ };
+}
+
 async function poll() {
   if (state.mode === "graph") {
     try {

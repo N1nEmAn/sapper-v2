@@ -114,6 +114,7 @@ export function createGraph(svgSelector, opts = {}) {
       }).on("mouseleave", () => { tip.style.display = "none"; });
     }
 
+    if (sim) sim.stop();   // one live simulation only; otherwise they fight
     const cx = size().w / 2, cy = size().h / 2;
     sim = d3.forceSimulation(nodes)
       .force("link", d3.forceLink(links).id((d) => d.id).distance(opts.linkDistance || 80)

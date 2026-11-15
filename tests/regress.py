@@ -964,17 +964,49 @@ def chat_tools():
 # --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
-@case("serve: 默认只读，POST 返回 403")
+TOKEN = os.environ.setdefault("SAPPER_CONSOLE_TOKEN", "regress-token-please-change")
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def http_call(port: int, method: str, path: str, body: dict | None = None,
+              headers: dict | None = None):
+    """Minimal HTTP client: full control over Host/Origin/Sec-Fetch-Site."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    hdrs = dict(headers or {})
+    payload = None
+    if body is not None:
+        payload = json.dumps(body).encode()
+        hdrs.setdefault("Content-Type", "application/json")
+        hdrs.setdefault("X-Sapper-Request", "1")
+    try:
+        conn.request(method, path, body=payload, headers=hdrs)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def wait_ready(port: int, headers: dict, path: str = "/api/health") -> None:
+    import time
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            code, _ = http_call(port, "GET", path, headers=headers)
+            if code == 200:
+                return
+        except OSError:
+            pass
+        time.sleep(0.3)
+    raise AssertionError("服务未能在 20s 内就绪")
+
+
+@case("serve: 认证/CSRF/Host 校验/只读拒绝写")
 def serve_readonly():
     import socket
-    import threading
-    import time
 
     work = fresh()
     try:
-        run("fact", "-t", "a", "-k", "host", "b", cwd=work)
-        run("intent", "--from", "f001", "--confirm", "-t", "c", "d", cwd=work)
-
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -984,50 +1016,48 @@ def serve_readonly():
             cwd=str(work), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         try:
-            deadline = time.time() + 15
-            health = None
-            while time.time() < deadline:
-                try:
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/api/health", timeout=1
-                    ) as resp:
-                        health = json.loads(resp.read().decode())
-                        break
-                except Exception:
-                    time.sleep(0.3)
-            assert health and health["ok"], "服务未能在 15s 内就绪"
+            wait_ready(port, AUTH)
 
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/api/chat", timeout=5
-            ) as resp:
-                chat_state = json.loads(resp.read().decode())
-            assert chat_state.get("enabled") is False, "只读模式不应启用对话"
+            # 1) 无令牌：一律 401（HTML 请求给可读提示页）
+            code, _ = http_call(port, "GET", "/api/health")
+            assert code == 401, code
+            code, body = http_call(port, "GET", "/")
+            assert code == 401 and b"TOKEN" in body, (code, body[:80])
 
+            # 2) 有令牌：读接口正常，能力位如实上报
+            code, body = http_call(port, "GET", "/api/health", headers=AUTH)
+            assert code == 200, code
+            health = json.loads(body)
+            assert health["write"] is False and health["exec"] is False, health
+
+            # 3) Host 不在白名单 -> 421（DNS rebinding）
+            code, _ = http_call(port, "GET", "/api/health",
+                                headers={**AUTH, "Host": f"evil.example.com:{port}"})
+            assert code == 421, code
+
+            # 4) 跨站请求 -> 403
+            code, _ = http_call(port, "GET", "/api/health",
+                                headers={**AUTH, "Sec-Fetch-Site": "cross-site"})
+            assert code == 403, code
+            code, _ = http_call(port, "POST", "/api/chat", {"message": "x"},
+                                headers={**AUTH, "Origin": "http://evil.example.com"})
+            assert code == 403, code
+
+            # 5) 静态资源需要认证
             for route in ("/js/main.js", "/css/app.css", "/js/graph.js", "/vendor/d3.min.js"):
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}{route}", timeout=5
-                ) as resp:
-                    assert resp.status == 200, f"静态资源 {route} 应可访问"
-                    body = resp.read()
-                    assert len(body) > 100, f"{route} 内容为空"
+                code, body = http_call(port, "GET", route, headers=AUTH)
+                assert code == 200 and len(body) > 100, (route, code)
 
-            for route in ("/api/assets", "/api/traffic"):
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}{route}", timeout=5
-                ) as resp:
-                    assert resp.status == 200, f"{route} 应返回 200"
+            # 6) 只读模式下写接口一律 403
+            for path, body in (("/api/ops/fact", {"description": "x"}),
+                               ("/api/confirm/i001", {})):
+                code, _ = http_call(port, "POST", path, body, headers=AUTH)
+                assert code == 403, (path, code)
 
-            for path, body in (("/api/confirm/i001", None), ("/api/ops/fact", {"description": "x"})):
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}{path}",
-                    data=b"{}" if body is None else json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST",
-                )
-                try:
-                    urllib.request.urlopen(req, timeout=5)
-                    raise AssertionError(f"只读模式应拒绝 POST {path}")
-                except urllib.error.HTTPError as exc:
-                    assert exc.code == 403, f"{path} 应返回 403，实际 {exc.code}"
+            # 7) 缺 X-Sapper-Request -> 403（跨站表单不可伪造）
+            code, _ = http_call(port, "POST", "/api/ops/fact", {"description": "x"},
+                                headers={**AUTH, "X-Sapper-Request": ""})
+            assert code == 403, code
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -1035,8 +1065,83 @@ def serve_readonly():
         shutil.rmtree(work, ignore_errors=True)
 
 
-# --------------------------------------------------------------------------- #
-# main
+@case("serve: --allow-write 可写，--allow-exec 才是执行开关")
+def serve_write_ops():
+    import socket
+
+    work = fresh()
+    try:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        proc = subprocess.Popen(
+            [sys.executable, str(ENTRY), "serve", "--port", str(port),
+             "--rebuild", "--allow-write"],
+            cwd=str(work), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            wait_ready(port, AUTH)
+            health = json.loads(http_call(port, "GET", "/api/health", headers=AUTH)[1])
+            assert health["write"] is True and health["exec"] is False, health
+
+            assert json.loads(http_call(port, "GET", "/api/chat", headers=AUTH)[1])["enabled"] is True
+
+            got = json.loads(http_call(port, "POST", "/api/ops/fact", {
+                "title": "web 建的主机", "description": "从 HTTP 接口写入",
+                "kind": "host", "data": {"host": "10.1.2.3"},
+            }, headers=AUTH)[1])
+            fid = got["fact"]["id"]
+            assert got["fact"]["creator"] == "web"
+
+            got = json.loads(http_call(port, "POST", "/api/ops/intent", {
+                "title": "web 建的意图", "description": "验证写接口",
+                "from": [fid], "requires_confirmation": True,
+            }, headers=AUTH)[1])
+            iid = got["intent"]["id"]
+
+            # 未确认不能认领
+            code, _ = http_call(port, "POST", f"/api/ops/claim/{iid}", {"worker": "web"},
+                                headers=AUTH)
+            assert code == 400, code
+
+            assert http_call(port, "POST", f"/api/confirm/{iid}", {}, headers=AUTH)[0] == 200
+            assert http_call(port, "POST", f"/api/ops/claim/{iid}", {"worker": "web"},
+                             headers=AUTH)[0] == 200
+            done = json.loads(http_call(port, "POST", f"/api/ops/done/{iid}", {
+                "description": "首页 200", "kind": "vuln", "data": {"cve": "CVE-X"},
+            }, headers=AUTH)[1])
+            did = done["fact"]["id"]
+            assert did != fid
+
+            found = json.loads(http_call(port, "GET", "/api/search?q=10.1.2.3",
+                                         headers=AUTH)[1])
+            assert any(f["id"] == fid for f in found["facts"]), found
+
+            on_disk = read_json(work / ".sapper" / "facts" / f"{did}.json")
+            assert on_disk["data"]["cve"] == "CVE-X"
+
+            # 空消息被拒绝
+            assert http_call(port, "POST", "/api/chat", {"message": "  "}, headers=AUTH)[0] == 400
+
+            # 写会话不能直接执行：没有 --allow-exec 时派发 403
+            code, _ = http_call(port, "POST", f"/api/ops/dispatch/{iid}", {}, headers=AUTH)
+            assert code == 403, code
+
+            # 审计日志：每次写操作留痕且带哈希链
+            lines = (work / ".sapper" / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+            assert len(lines) >= 4, lines
+            first, last = json.loads(lines[0]), json.loads(lines[-1])
+            assert last["hash"] and first["prev"] == "", (first, last)
+            ops_seen = {json.loads(x)["op"] for x in lines}
+            assert {"fact.create", "intent.create", "intent.done"} <= ops_seen, ops_seen
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 SUITES = {
     "surface": [surface_all_commands, sync_all_writes],

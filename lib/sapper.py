@@ -3631,12 +3631,18 @@ def cmd_serve(args) -> int:
             chat = chat_mod.ChatSession(store.root, ops)
         except Exception as exc:  # chat is optional; never block serve on it
             print(f"chat disabled: {exc}", file=sys.stderr)
-        print("write enabled: POST /api/ops/* (fact/intent/claim/release/done/dispatch)")
+        print("write enabled: POST /api/ops/* (fact/intent/claim/release/done/assets)")
         print("              POST /api/confirm/<id>       (approve an intent)")
         print("              POST /api/chat               (conversational operator)")
+        if not getattr(args, "allow_exec", False):
+            print("exec  disabled: 派发/停止执行需要 --allow-exec（防止会话被拿走后直接 RCE）")
 
+    token = os.environ.get("SAPPER_CONSOLE_TOKEN") or secrets.token_urlsafe(24)
     srv_mod = _load_lib("server", "server.py")
-    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb, ops, chat)
+    console = srv_mod.Console(
+        db_path, web_root, args.host, args.port, confirm_cb, ops, chat,
+        token=token, allow_exec=bool(getattr(args, "allow_exec", False)),
+    )
     try:
         console.serve_forever()
     except KeyboardInterrupt:
@@ -5397,7 +5403,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--port", type=int, default=8787, help="port")
     sp.add_argument("--rebuild", action="store_true", help="re-import JSON files into the index")
     sp.add_argument("--allow-write", action="store_true",
-                    help="enable POST /api/confirm/<id> (approve intents from the console)")
+                    help="enable POST endpoints (graph mutations from the console)")
+    sp.add_argument("--allow-exec", action="store_true",
+                    help="allow the console to spawn executors (separate from --allow-write)")
     sp.set_defaults(func=cmd_serve)
 
     sp = sub.add_parser("dispatch", help="run a commander/executor step via the claude CLI")

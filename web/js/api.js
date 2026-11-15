@@ -3,16 +3,22 @@
 async function parse(resp) {
   let data = {};
   try { data = await resp.json(); } catch (e) { /* empty body */ }
+  if (resp.status === 401) {
+    throw new Error("会话已失效：请用 sapper serve 启动时打印的 ?t= 链接重新打开");
+  }
   if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
   return data;
 }
 
 export const getJSON = (url) => fetch(url).then(parse);
 
+// X-Sapper-Request is what makes writes unforgeable from a cross-site form:
+// a form cannot set custom headers, and a cross-origin fetch would need a
+// preflight that this server refuses.
 export const postJSON = (url, body) =>
   fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Sapper-Request": "1" },
     body: JSON.stringify(body || {}),
   }).then(parse);
 

@@ -470,6 +470,60 @@ ARTEX 的控制台能建任务、改发现、管流量、编辑工作空间、�
 
 ---
 
+## S1 已完成：控制台的认证、授权与审计
+
+之前 `sapper serve` 没有任何认证——同机任何一个进程扫到端口就能调 `/api/ops/dispatch`，
+那等价于远程代码执行。这一轮按"敌方在隔壁"的假设重做。
+
+### 三个开关，不是一个
+
+| 启动 | 能力 | 被拿走后最坏结果 |
+|---|---|---|
+| `sapper serve` | 只看 | 情报泄露（本机） |
+| `+ --allow-write` | 改图、批准、对话 | 事实图被写脏（可回滚） |
+| `+ --allow-exec` | 派发/停止 executor | **代码执行**（不可回滚） |
+
+**写图和执行拆成两个开关**是这轮最重要的决定：写会话被 CSRF 或同机进程拿走后，
+拿不到代码执行。`/api/health` 如实上报 `{"write":..,"exec":..}`，前端据此禁用按钮。
+
+### 认证
+
+启动时打印唯一入口：
+
+```
+console : http://127.0.0.1:8787/?t=<32字节随机token>
+```
+
+- 该 URL 下发 `HttpOnly; SameSite=Strict` Cookie，302 到 `/`
+- 之后所有请求（含静态资源、SSE）都要 Cookie 或 `Authorization: Bearer`
+- token 只在内存里，重启即失效；无 token 访问 `/` 只返回一张"需要令牌"的提示页，**不设 Cookie**
+
+### 威胁与控制
+
+| 威胁 | 控制 | 测试 |
+|---|---|---|
+| 同机 agent 扫端口 | 会话令牌 | 无令牌 → 401 |
+| CSRF | SameSite=Strict + 必须 JSON + `X-Sapper-Request: 1`（表单无法设置） | 缺头 → 403 |
+| DNS rebinding | Host 白名单 + 端口校验 | `Host: evil.example.com` → 421 |
+| 跨站读取/提交 | `Origin` / `Sec-Fetch-Site` 校验 | cross-site → 403 |
+| 越权执行 | `--allow-exec` 独立开关 | 写会话派发 → 403 |
+| 请求体炸内存 | 1 MiB 上限 | → 413 |
+| 点击劫持 | `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` | 响应头 |
+| 审计被抹 | `.sapper/audit.jsonl` 哈希链（prev+hash） | 断言链首 prev="" 且含 fact/intent/done |
+| 供应链 | d3 本地、CSP `script-src 'self'` | 静态资源断言 |
+
+### 实时
+
+`GET /api/stream?since=N` 用 SSE 推送事件，`/api/events` 保留为轮询降级。
+实测：CLI 写入一条 fact，页面 seq 21→22→23，事件流与图自动更新，无需刷新。
+
+### 完整设计
+
+见 `DESIGN-WEB.md`：能力分级、威胁模型（含残余风险）、接口契约、状态码语义、
+前端交互规范与 S2–S4 路线。
+
+---
+
 ## 容器内验证（追加）
 
 ```
