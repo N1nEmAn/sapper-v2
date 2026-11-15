@@ -3750,6 +3750,48 @@ def cmd_armory(args) -> int:
                     print(f"     ! {c}")
         return 0
 
+    if action == "evolve":
+        if not args.target:
+            raise FGError("armory evolve 需要武器 id")
+        evolver = _load_lib("evolver", "evolver.py")
+        avp = _load_lib("avprobe", "avprobe.py")
+        engines = avp.detect_engines()
+        engine = args.engine
+        if engine != "mock" and not engines.get(engine, {}).get("available"):
+            note = engines.get(engine, {}).get("note", "")
+            raise FGError(f"探测引擎 {engine} 不可用：{note}（用 --engine mock 演练，"
+                          f"或 `sapper armory evolve ... --engine mock`）")
+        payload = None
+        if args.payload_file:
+            import pathlib
+            ppath = pathlib.Path(args.payload_file)
+            if not ppath.is_file():
+                raise FGError(f"payload 文件不存在: {ppath}")
+            payload = ppath.read_bytes()
+        elif args.payload:
+            payload = args.payload.encode("utf-8")
+        def _step(s):
+            mark = {"clean": "放行", "detected": "被拦", "error": "异常"}
+            gate = {"static": "静态", "dynamic": "动态"}.get(s.get("gate"), s.get("gate", ""))
+            res_key = "static_result" if s.get("gate") == "static" else "dynamic_result"
+            st = mark.get(s.get(res_key), s.get(res_key) or "-")
+            applied = ",".join(t.get("transform") or t.get("behavior")
+                               for t in (s.get("static_applied") or [])) or "(裸)"
+            dyn = ("," .join(t.get("behavior") for t in (s.get("dynamic_applied") or [])))
+            nxt = f" → 派生 {s['new_variant']}" if s.get("new_variant") else ""
+            line = f"  R{s['round']} {s['variant']} 栈[{len(s['stack'])}] {gate}关{st} [{applied}]"
+            if s.get("gate") == "dynamic":
+                line += f" 动态[{dyn or '无'}]"
+            print(line + nxt)
+        transcript = evolver.evolve(
+            args.target, args.vid, engine=engine, profile=_split_profile(args),
+            rounds=args.rounds, top=args.top, payload=payload, ext=args.ext,
+            c2_host=args.c2_host, c2_port=args.c2_port,
+            on_step=_step,
+        )
+        print(evolver.render_steps(transcript))
+        return 0
+
     raise FGError(f"unknown armory action: {action}")
 
 
@@ -4153,7 +4195,8 @@ class _ConsoleOps:
                 "categories": ev.categories(),
                 "layers": {l["id"]: {"name": l["name"], "cat": l["cat"],
                                      "risk": l["risk"], "cost": l["cost"]}
-                           for l in ev.registry()["layers"]}}
+                           for l in ev.registry()["layers"]},
+                "engines": _load_lib("avprobe", "avprobe.py").detect_engines()}
 
     def armory_attribute(self, wid: str, profile: list[str] | None = None) -> dict:
         armory = self._armory()
@@ -4338,6 +4381,22 @@ class _ConsoleOps:
 
     def armory_seed(self) -> dict:
         return {"seeded": self._armory().seed()}
+
+    def armory_evolve(self, wid: str, vid: str | None = None,
+                      profile: list[str] | None = None, engine: str = "huorong",
+                      rounds: int = 5, top: int = 1, payload: str | None = None,
+                      ext: str = ".com", c2_host: str = "127.0.0.1",
+                      c2_port: int = 45678) -> dict:
+        evolver = _load_lib("evolver", "evolver.py")
+        avp = _load_lib("avprobe", "avprobe.py")
+        engines = avp.detect_engines()
+        if engine != "mock" and not engines.get(engine, {}).get("available"):
+            raise FGError(f"探测引擎 {engine} 不可用"
+                          f"：{engines.get(engine, {}).get('note', '')}")
+        data = payload.encode("utf-8") if payload else None
+        return evolver.evolve(wid, vid, engine=engine, profile=profile,
+                              rounds=rounds, top=top, payload=data, ext=ext,
+                              c2_host=c2_host, c2_port=c2_port)
 
     # -- asset layer --------------------------------------------------------
     def asset_action(self, action: str, key: str) -> dict:
@@ -6203,7 +6262,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("armory", help="self-scoring weapon library")
     sp.add_argument("armory_action", nargs="?", default="list",
                     choices=["list", "show", "add", "search", "use", "report", "seed",
-                             "stack", "attribute", "derive", "recommend",
+                             "stack", "attribute", "derive", "recommend", "evolve",
                              "import", "export", "from-cve"])
     sp.add_argument("target", nargs="?", help="weapon id (or keyword for search/recommend)")
     sp.add_argument("--name", help="weapon name (add)")
@@ -6211,7 +6270,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--cve", action="append", help="CVE id (add, repeatable)")
     sp.add_argument("--variant", action="append",
                     help="vid:desc:command (add, repeatable)")
-    sp.add_argument("--vid", help="variant id (use, report, stack, derive)")
+    sp.add_argument("--vid", help="variant id (use, report, stack, derive, evolve)")
     sp.add_argument("--lean", action="store_true",
                     help="prefer variants with fewer signatures (use)")
     sp.add_argument("--result", choices=["ok", "blocked", "fail"], help="outcome (report)")
@@ -6221,6 +6280,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--apply", nargs="?", const=True, default=False,
                     help="create the derived variant (derive); optional N = top N layers")
     sp.add_argument("--limit", type=int, default=3, help="max rows (derive/recommend)")
+    sp.add_argument("--engine", choices=["huorong", "defender", "mock"], default="huorong",
+                    help="local AV backend (evolve); mock = no disk/AV, tests only")
+    sp.add_argument("--rounds", type=int, default=5, help="max evolution rounds (evolve)")
+    sp.add_argument("--top", type=int, default=1, help="layers to add per round (evolve)")
+    sp.add_argument("--payload", default="",
+                    help="real payload string (evolve; default EICAR test string)")
+    sp.add_argument("--payload-file", help="read payload bytes from file (evolve)")
+    sp.add_argument("--ext", default=".com", help="sample file extension (evolve)")
+    sp.add_argument("--c2-host", default="127.0.0.1",
+                    help="dynamic beacon callback host (evolve; real C2 to test dynamic block)")
+    sp.add_argument("--c2-port", type=int, default=45678,
+                    help="dynamic beacon callback port (evolve)")
     sp.add_argument("--json", action="store_true", help="raw json (show)")
     sp.add_argument("--file", help="YAML file path (import/export)")
     sp.add_argument("--all", action="store_true", help="export all weapons / cve force")

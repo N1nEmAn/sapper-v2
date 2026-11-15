@@ -1138,6 +1138,83 @@ def armory_evasion_flow():
         shutil.rmtree(work, ignore_errors=True)
 
 
+@case("avprobe: mock 探测序列可控，动态探测能回连")
+def avprobe_probe():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import avprobe as avp
+
+    avp.set_mock_sequence(["detected", "clean"])
+    assert avp.probe_bytes(b"x", engine="mock")["result"] == "detected"
+    assert avp.probe_bytes(b"x", engine="mock")["result"] == "clean"
+    assert avp.probe_bytes(b"x", engine="mock")["path"] == ""  # mock 不落盘
+
+    avp.set_dynamic_mock_sequence(["detected", "clean"])
+    assert avp.probe_dynamic("print(1)", c2_host="mock")["result"] == "detected"
+    assert avp.probe_dynamic("print(1)", c2_host="mock")["result"] == "clean"
+
+    # 真实回连：本地回环 mock C2 收到 beacon
+    r = avp.probe_dynamic(
+        "import socket\n"
+        "s = socket.socket(); s.settimeout(5)\n"
+        "s.connect(('127.0.0.1', 45699)); s.send(b'beacon'); s.close()\n"
+        "print('BEACON_SENT')\n",
+        c2_port=45699, timeout=10,
+    )
+    assert r["result"] == "clean" and r["beacon_reached"], r
+
+
+@case("evolve: mock 双关——静态被拦派生静态层，动态被拦派生动态层")
+def evolve_dual_gate():
+    # Isolated armory root: the module caches DEFAULT_ROOT at import time, and
+    # the serve suite (subprocess) must not see these derived weapons.
+    work = fresh()
+    prev = os.environ.get("SAPPER_ARMORY_ROOT")
+    os.environ["SAPPER_ARMORY_ROOT"] = str(work / "armory")
+    sys.path.insert(0, str(ROOT / "lib"))
+    try:
+        import armory as arm
+        import evolver as ev
+        import avprobe as avp
+
+        a = arm.Armory()
+        a.seed()
+
+        def reset(wid):
+            w = a.load(wid)
+            w["variants"] = [v for v in w["variants"] if not v.get("derived_from")]
+            w["attempts"] = []
+            w["derived"] = []
+            a.save(w)
+
+        # 静态关被拦 → 派生静态可落地层（obf.string-enc）
+        reset("w005")
+        avp.set_mock_sequence(["detected", "clean"])
+        avp.set_dynamic_mock_sequence(["clean"])
+        t = ev.evolve("w005", vid="v1", engine="mock", profile=["huorong"],
+                      rounds=3, top=1, c2_host="mock")
+        assert t["success"], t["reason"]
+        w = a.load("w005")
+        stat = [v for v in w["variants"] if v.get("derived_from")]
+        assert stat and stat[0]["stack"][0] == "obf.string-enc", stat[0]["stack"]
+
+        # 动态关被拦 → 派生动态可落地层（sb.sleep-skip）
+        reset("w005")
+        avp.set_mock_sequence(["clean"])
+        avp.set_dynamic_mock_sequence(["detected", "clean"])
+        t = ev.evolve("w005", vid="v1", engine="mock", profile=["huorong"],
+                      rounds=3, top=1, c2_host="mock")
+        assert t["success"], t["reason"]
+        w = a.load("w005")
+        dyn = [v for v in w["variants"] if v.get("derived_from")]
+        assert dyn and dyn[0]["stack"][0] == "sb.sleep-skip", dyn[0]["stack"]
+    finally:
+        if prev is None:
+            os.environ.pop("SAPPER_ARMORY_ROOT", None)
+        else:
+            os.environ["SAPPER_ARMORY_ROOT"] = prev
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # plan (long-running, multi-step chains)
 # --------------------------------------------------------------------------- #
@@ -1579,6 +1656,7 @@ SUITES = {
     "chat": [chat_tools],
     "evasion": [evasion_registry, evasion_validate, evasion_prior,
                 evasion_attribution, evasion_derive, armory_evasion_flow],
+    "evolve": [avprobe_probe, evolve_dual_gate],
     "plan": [plan_basic, plan_sync, plan_edges],
     "yaml": [yaml_roundtrip, taxonomy_ok, cve_flow],
     "serve": [serve_readonly, serve_write_ops],

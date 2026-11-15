@@ -152,6 +152,7 @@ export function renderArmory() {
       <footer>
         最优 <b>${w.best || "-"}</b>
         <button class="act" data-act="use-best">用最优变体</button>
+        <button class="act" data-act="evolve">自进化</button>
         <button class="act" data-act="attr">归因</button>
         <span class="spacer"></span>
         <span class="hint">${(w.variants || []).length} 变体</span>
@@ -165,6 +166,7 @@ export function renderArmory() {
       const act = btn.dataset.act;
       if (act === "use") useWeapon(wid, vid);
       else if (act === "derive") showDerive(wid, vid);
+      else if (act === "evolve") showEvolve(wid, vid);
       else report(wid, vid, act);
     };
   });
@@ -173,6 +175,13 @@ export function renderArmory() {
   });
   $$("#armory-list button[data-act=attr]").forEach((btn) => {
     btn.onclick = () => toggleAttribution(btn.closest(".wcard").dataset.wid);
+  });
+  $$("#armory-list button[data-act=evolve]").forEach((btn) => {
+    btn.onclick = () => {
+      const wcard = btn.closest(".wcard");
+      const vid = btn.closest(".vrow")?.dataset.vid || null;
+      showEvolve(wcard.dataset.wid, vid);
+    };
   });
 
   if (attrFor && attrRows.length) renderAttrInto(attrFor);
@@ -195,6 +204,7 @@ function variantRow(w, v) {
     <span class="vacts">
       <button class="act" data-act="use">用</button>
       <button class="act" data-act="derive">派生</button>
+      <button class="act" data-act="evolve">进化</button>
       <button class="act ok" data-act="ok">成功</button>
       <button class="act warn" data-act="blocked">被拦</button>
       <button class="act fail" data-act="fail">失败</button>
@@ -345,6 +355,84 @@ async function showRecommend() {
       </div>`).join("") : "<div class='hint'>没有匹配的武器</div>"}
     <div class="mrow"><button class="act" id="rec-close">关闭</button></div>`;
   $("#rec-close").onclick = () => { box.style.display = "none"; };
+}
+
+async function showEvolve(wid, vid) {
+  const engines = last.engines || {};
+  const avail = Object.entries(engines)
+    .filter(([k, v]) => v.available && k !== "mock");
+  const box = $("#armory-out");
+  box.style.display = "block";
+  box.innerHTML = `
+    <div class="dtitle">${escapeHtml(wid)}${vid ? "/" + escapeHtml(vid) : ""} 自进化
+      <span class="hint">投样本给本地 AV，被拦自动派生下一变体</span></div>
+    <div class="form">
+      <label>探测引擎</label>
+      <select id="evo-engine">
+        ${avail.map(([k, v]) =>
+          `<option value="${k}" ${k === "huorong" ? "selected" : ""}>${k} · ${escapeHtml(v.note || "")}</option>`).join("")}
+        <option value="mock">mock · 演练（不落盘/不触发 AV）</option>
+      </select>
+      <label>轮数上限</label><input id="evo-rounds" type="number" value="5" min="1" max="20">
+      <label>每轮加层数</label><input id="evo-top" type="number" value="1" min="1" max="3">
+      <label>C2 回连地址（动态关）</label>
+      <input id="evo-c2" placeholder="127.0.0.1:45678" title="本地 mock 测行为链路；真实 C2 才能触发动态拦截">
+      <label>真实载荷（留空=EICAR 静态 + 无害动态）</label>
+      <textarea id="evo-payload" placeholder="自定义 payload 内容，用于测真实样本"></textarea>
+      <div class="mrow">
+        <button class="act pri" id="evo-start">开始进化</button>
+        <button class="act" id="evo-close">关闭</button>
+      </div>
+      <div id="evo-out"></div>
+    </div>`;
+  $("#evo-close").onclick = () => { box.style.display = "none"; };
+  $("#evo-start").onclick = async () => {
+    const engine = $("#evo-engine").value;
+    const rounds = parseInt($("#evo-rounds").value) || 5;
+    const top = parseInt($("#evo-top").value) || 1;
+    const payload = $("#evo-payload").value.trim();
+    const c2raw = $("#evo-c2").value.trim() || "127.0.0.1:45678";
+    const [c2_host, c2_port] = c2raw.includes(":")
+      ? [c2raw.slice(0, c2raw.lastIndexOf(":")), c2raw.slice(c2raw.lastIndexOf(":") + 1)]
+      : [c2raw, "45678"];
+    const out = $("#evo-out");
+    out.innerHTML = `<div class="hint">进化中…静态落盘扫描 + 动态运行观测（每轮约 ${rounds}×3s）</div>`;
+    try {
+      const d = await api.armoryOp({
+        action: "evolve", weapon: wid, vid, engine, rounds, top,
+        payload: payload || null, c2_host, c2_port, profile: currentProfile(),
+      });
+      renderEvolveResult(out, d);
+      await loadArmory();
+    } catch (e) {
+      out.innerHTML = `<div class="hint" style="color:#a32d2d">进化失败: ${escapeHtml(e.message)}</div>`;
+    }
+  };
+}
+
+function renderEvolveResult(out, d) {
+  const steps = d.steps || [];
+  const mark = { clean: "放行", detected: "被拦", error: "异常" };
+  const gateName = { static: "静态", dynamic: "动态" };
+  out.innerHTML = `
+    <div class="dtitle" style="color:${d.success ? "#3b6d11" : "#a32d2d"}">
+      ${d.success ? "✅ 双关通过" : "❌ 未突破"} — ${escapeHtml(d.reason)}</div>
+    ${steps.map((s) => {
+      const st = mark[s.static_result] || s.static_result;
+      const dyn = s.dynamic_result ? ` · 动态${mark[s.dynamic_result]}` : "";
+      const bcn = s.beacon_reached != null ? ` · 回连${s.beacon_reached ? "✓" : "✗"}` : "";
+      const sApp = (s.static_applied || []).map((a) => a.transform).join("+") || "(裸)";
+      const dApp = (s.dynamic_applied || []).map((a) => a.behavior).join("+");
+      return `<div class="pick">
+        <div><b>R${s.round} ${escapeHtml(s.variant)}</b>
+          <span class="hint">栈[${s.stack.length}] · ${gateName[s.gate] || s.gate}关 · 静态${st}${dyn}${bcn}</span></div>
+        <div class="hint">静态[${escapeHtml(sApp)}]${dApp ? ` · 动态[${escapeHtml(dApp)}]` : ""}
+          ${s.new_variant ? ` → 派生 ${escapeHtml(s.new_variant)}` : ""}</div>
+      </div>`;
+    }).join("")}
+    ${d.note ? `<div class="hint">${escapeHtml(d.note)}</div>` : ""}
+    <div class="mrow"><button class="act" id="evo-done">完成</button></div>`;
+  $("#evo-done").onclick = () => { $("#armory-out").style.display = "none"; };
 }
 
 function openNewWeapon() {

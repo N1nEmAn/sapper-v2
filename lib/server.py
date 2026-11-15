@@ -647,6 +647,16 @@ class Handler(BaseHTTPRequestHandler):
                         result = self.ops.armory_add(body)
                     elif sub == "seed":
                         result = self.ops.armory_seed()
+                    elif sub == "evolve":
+                        result = self.ops.armory_evolve(
+                            body.get("weapon") or "", body.get("vid") or None, prof,
+                            engine=body.get("engine") or "huorong",
+                            rounds=int(body.get("rounds") or 5),
+                            top=int(body.get("top") or 1),
+                            payload=body.get("payload") or None,
+                            ext=body.get("ext") or ".com",
+                            c2_host=body.get("c2_host") or "127.0.0.1",
+                            c2_port=int(body.get("c2_port") or 45678))
                     else:
                         raise ValueError(f"未知的武器库动作 {sub!r}")
                     self._audit(f"armory.{sub}", body.get("weapon") or "", True)
