@@ -850,6 +850,14 @@ def serve_write_ops():
                 "title": "web 建的主机", "description": "从 HTTP 接口写入",
                 "kind": "host", "data": {"host": "10.1.2.3"},
             })
+            assert api("/api/chat").get("enabled") is True, "写模式应启用对话"
+            try:
+                api("/api/chat", {"message": "  "})
+                raise AssertionError("空消息应被拒绝")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+            assert api("/api/chat").get("messages") is not None
+
             fid = got["fact"]["id"]
             assert fid.startswith("f"), got
             assert got["fact"]["creator"] == "web"
@@ -890,6 +898,70 @@ def serve_write_ops():
 
 
 # --------------------------------------------------------------------------- #
+# chat (conversational operator)
+# --------------------------------------------------------------------------- #
+@case("chat: 工具层只做受控动作，未知工具报错")
+def chat_tools():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import chat as chatmod
+
+    calls = []
+
+    class Ops:
+        store = None
+
+        def fact(self, body):
+            calls.append(("fact", body.get("kind")))
+            return {"id": "f009", "kind": body.get("kind")}
+
+        def intent(self, body):
+            calls.append(("intent", body.get("title")))
+            return {"id": "i009", "title": body.get("title")}
+
+        def done(self, iid, body):
+            calls.append(("done", iid))
+            return {"fact": {"id": "f010"}, "intent": {"id": iid}}
+
+        def search(self, q):
+            return {"q": q, "facts": [], "intents": [], "assets": [], "traffic": []}
+
+    work = Path(tempfile.mkdtemp(prefix="sapper-chat-"))
+    try:
+        session = chatmod.ChatSession(work, Ops())
+        assert session._tool("create_fact", {"description": "x", "kind": "host"})["id"] == "f009"
+        assert session._tool("create_intent", {"from": ["f009"], "description": "y"})["id"] == "i009"
+        assert session._tool("complete_intent", {"id": "i009", "description": "z"})["fact"] == "f010"
+        assert [a["tool"] for a in session.actions] == [
+            "create_fact", "create_intent", "complete_intent"], session.actions
+        assert calls == [("fact", "host"), ("intent", None), ("done", "i009")], calls
+
+        try:
+            session._tool("shell", {"cmd": "rm -rf /"})
+            raise AssertionError("未知工具必须报错")
+        except chatmod.ChatError:
+            pass
+
+        # view() must hide tool_result payloads and keep text/tool chips
+        session.messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "看一下"},
+                {"type": "tool_use", "id": "t1", "name": "search_facts", "input": {"q": "x"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "{}"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "结论"}]},
+        ]
+        view = session.view()
+        roles = [v["role"] for v in view]
+        assert roles == ["user", "assistant", "tool", "assistant"], roles
+        assert view[2]["text"] == "search_facts"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 @case("serve: 默认只读，POST 返回 403")
@@ -924,6 +996,20 @@ def serve_readonly():
                 except Exception:
                     time.sleep(0.3)
             assert health and health["ok"], "服务未能在 15s 内就绪"
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/chat", timeout=5
+            ) as resp:
+                chat_state = json.loads(resp.read().decode())
+            assert chat_state.get("enabled") is False, "只读模式不应启用对话"
+
+            for route in ("/js/main.js", "/css/app.css", "/js/graph.js", "/vendor/d3.min.js"):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}{route}", timeout=5
+                ) as resp:
+                    assert resp.status == 200, f"静态资源 {route} 应可访问"
+                    body = resp.read()
+                    assert len(body) > 100, f"{route} 内容为空"
 
             for route in ("/api/assets", "/api/traffic"):
                 with urllib.request.urlopen(
@@ -966,6 +1052,7 @@ SUITES = {
                armory_done_link, armory_errors],
     "assets": [assets_ingest, assets_cross_task, assets_rebuild],
     "traffic": [traffic_filter, traffic_query, traffic_clear_guard],
+    "chat": [chat_tools],
     "serve": [serve_readonly, serve_write_ops],
 }
 

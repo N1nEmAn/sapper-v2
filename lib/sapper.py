@@ -3531,6 +3531,24 @@ class _ConsoleOps:
         state["proc"].terminate()
         return {"ok": True}
 
+    # -- asset layer --------------------------------------------------------
+    def asset_action(self, action: str, key: str) -> dict:
+        """Manage the global asset store from the console."""
+        if not key:
+            raise FGError("asset action 需要 key")
+        mod = _load_lib("assets", "assets.py")
+        db = mod.AssetDB()
+        if action == "forget":
+            return {"deleted": db.forget(key), "key": key}
+        if action == "seed":
+            row = db.get(key)
+            if row is None:
+                raise FGError(f"资产 {key} 不存在")
+            created, skipped = mod.seed_into(self.store, key, limit=1)
+            return {"created": len(created), "skipped": skipped,
+                    "facts": [f["id"] for f in created]}
+        raise FGError(f"未知的资产动作 {action!r}")
+
     # -- search -------------------------------------------------------------
     def search(self, q: str, limit: int = 40) -> dict:
         q = (q or "").strip()
@@ -3602,16 +3620,23 @@ def cmd_serve(args) -> int:
 
     confirm_cb = None
     ops = None
+    chat = None
     if getattr(args, "allow_write", False):
         def confirm_cb(iid: str) -> None:
             intent = store.confirm_intent(iid)
             print(f"confirmed {intent['id']} via web console", file=sys.stderr)
         ops = _ConsoleOps(store, mod)
+        chat_mod = _load_lib("chat", "chat.py")
+        try:
+            chat = chat_mod.ChatSession(store.root, ops)
+        except Exception as exc:  # chat is optional; never block serve on it
+            print(f"chat disabled: {exc}", file=sys.stderr)
         print("write enabled: POST /api/ops/* (fact/intent/claim/release/done/dispatch)")
         print("              POST /api/confirm/<id>       (approve an intent)")
+        print("              POST /api/chat               (conversational operator)")
 
     srv_mod = _load_lib("server", "server.py")
-    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb, ops)
+    console = srv_mod.Console(db_path, web_root, args.host, args.port, confirm_cb, ops, chat)
     try:
         console.serve_forever()
     except KeyboardInterrupt:

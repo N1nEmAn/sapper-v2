@@ -36,6 +36,7 @@ class Handler(BaseHTTPRequestHandler):
     web_root: Path | None = None
     confirm_cb = None
     ops = None
+    chat = None
 
     def log_message(self, fmt: str, *args) -> None:  # keep the console quiet
         return
@@ -184,6 +185,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(rec)
                 return
 
+            if route == "/api/chat":
+                if self.chat is None:
+                    self._json({"enabled": False, "messages": []})
+                    return
+                self._json({"enabled": True, "messages": self.chat.view()})
+                return
+
             if route == "/api/search":
                 qs = parse_qs(parsed.query)
                 q = (qs.get("q") or [""])[0]
@@ -233,6 +241,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, 400)
             return
 
+        if route.startswith("/api/chat"):
+            if self.chat is None:
+                self._json({"error": "chat disabled (start with --allow-write)"}, 403)
+                return
+            try:
+                body = self._body()
+                if route == "/api/chat/reset":
+                    self.chat.reset()
+                    self._json({"ok": True, "messages": []})
+                elif route == "/api/chat":
+                    self._json({"ok": True, **self.chat.send(body.get("message") or "")})
+                else:
+                    self._json({"error": "not found"}, 404)
+            except Exception as exc:
+                self._json({"error": str(exc)}, 400)
+            return
+
         if route.startswith("/api/ops/"):
             if self.ops is None:
                 self._json({"error": "write disabled (start with --allow-write)"}, 403)
@@ -256,6 +281,9 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": True, **self.ops.dispatch(target, body)})
                 elif action == "dispatch_stop" and target:
                     self._json(self.ops.dispatch_stop(target))
+                elif action == "assets":
+                    self._json({"ok": True, **self.ops.asset_action(
+                        body.get("action") or "", body.get("key") or "")})
                 else:
                     self._json({"error": f"unknown op {action!r}"}, 404)
             except Exception as exc:
@@ -267,13 +295,14 @@ class Handler(BaseHTTPRequestHandler):
 
 class Console:
     def __init__(self, db_path: Path, web_root: Path, host: str = "127.0.0.1",
-                 port: int = 8787, confirm_cb=None, ops=None):
+                 port: int = 8787, confirm_cb=None, ops=None, chat=None):
         self.db_path = db_path
         self.web_root = web_root
         self.host = host
         self.port = port
         self.confirm_cb = confirm_cb
         self.ops = ops
+        self.chat = chat
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -288,6 +317,7 @@ class Console:
                 "web_root": self.web_root,
                 "confirm_cb": staticmethod(self.confirm_cb) if self.confirm_cb else None,
                 "ops": staticmethod(self.ops) if self.ops else None,
+                "chat": staticmethod(self.chat) if self.chat else None,
             },
         )
         return ThreadingHTTPServer((self.host, self.port), handler)
