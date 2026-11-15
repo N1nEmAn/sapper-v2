@@ -115,3 +115,11 @@ Reject only when execution would be clearly inappropriate:
 ```
 {hints}
 ```
+
+## Plan (persistent across your wake-ups)
+```
+{plan_block}
+```
+
+如果你上面写了规划待办：只派「前置已满足」的下一步，不要把整条链在一轮里展开；
+若某步已完成，先把它标 done 再派后续。没有待办就先建，再派第一步。

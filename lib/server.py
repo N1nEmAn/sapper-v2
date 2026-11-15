@@ -37,7 +37,7 @@ import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -107,7 +107,10 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, body, "application/json; charset=utf-8", extra)
 
     def _error(self, code: int, message: str) -> None:
-        self._json({"ok": False, "error": message}, code)
+        try:
+            self._json({"ok": False, "error": message}, code)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass      # client already gone; nothing useful to send
 
     def _host_ok(self) -> bool:
         raw = (self.headers.get("Host") or "").strip().lower()
@@ -138,6 +141,11 @@ class Handler(BaseHTTPRequestHandler):
         return (parsed.scheme == "http"
                 and (parsed.hostname or "") in {"127.0.0.1", "localhost", "::1"}
                 and (parsed.port or 80) == self.port)
+
+    def _profile(self) -> list[str]:
+        q = parse_qs(urlparse(self.path).query)
+        raw = (q.get("profile") or [""])[0]
+        return [t.strip() for t in raw.split(",") if t.strip()]
 
     def _is_navigation(self) -> bool:
         """Top-level page loads are not data access: let them through so the
@@ -260,8 +268,12 @@ class Handler(BaseHTTPRequestHandler):
             if secrets.compare_digest((qs.get("t") or [""])[0], self.token):
                 cookie = (f"{COOKIE_NAME}={self.token}; Path=/; HttpOnly; "
                           f"SameSite=Strict; Max-Age=86400")
+                # keep every other query param: ?t=...&profile=edr must survive
+                # the exchange or a shareable link silently loses its context
+                rest = {k: v[0] for k, v in qs.items() if k != "t" and v}
+                target = "/" + ("?" + urlencode(rest) if rest else "")
                 self.send_response(302)
-                self.send_header("Location", "/")
+                self.send_header("Location", target)
                 self.send_header("Set-Cookie", cookie)
                 for key, value in SECURITY_HEADERS.items():
                     self.send_header(key, value)
@@ -351,15 +363,35 @@ class Handler(BaseHTTPRequestHandler):
                 if self.ops is None:
                     self._error(403, "armory requires --allow-write")
                     return
-                self._json({"ok": True, **self.ops.armory_list()})
+                profile = self._profile()
+                self._json({"ok": True, **self.ops.armory_list(profile)})
+                return
+
+            if route == "/api/evasion/layers":
+                if self.ops is None:
+                    self._error(403, "evasion requires --allow-write")
+                    return
+                self._json({"ok": True, **self.ops.evasion_layers()})
+                return
+
+            if route == "/api/plan":
+                if self.ops is None:
+                    self._error(403, "plan requires --allow-write")
+                    return
+                self._json({"ok": True, **self.ops.plan_state()})
                 return
 
             if route.startswith("/api/armory/"):
                 if self.ops is None:
                     self._error(403, "armory requires --allow-write")
                     return
-                wid = route.rsplit("/", 1)[-1]
-                weapon = next((w for w in self.ops.armory_list()["weapons"]
+                rest = route[len("/api/armory/"):]
+                wid, _, suffix = rest.partition("/")
+                if suffix == "attribute":
+                    self._json({"ok": True,
+                                **self.ops.armory_attribute(wid, self._profile())})
+                    return
+                weapon = next((w for w in self.ops.armory_list(self._profile())["weapons"]
                                if w["id"] == wid), None)
                 if weapon is None:
                     self._json({"error": "not found", "id": wid}, 404)
@@ -447,7 +479,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                 time.sleep(1.0)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browsers drop SSE sockets on reload/navigate. On Windows this
+            # surfaces as WinError 10053 (ConnectionAbortedError), which is not
+            # a subclass of ConnectionResetError — catch it or every reload
+            # dumps a traceback.
             return
 
     # -- writes ------------------------------------------------------------
@@ -535,15 +571,51 @@ class Handler(BaseHTTPRequestHandler):
                     result = self.ops.dispatch_stop(target)
                     self._audit("executor.stop", target, bool(result.get("ok")))
                     self._json(result)
+                elif action == "plan":
+                    sub = (body.get("action") or "").strip()
+                    if sub == "add":
+                        result = {"step": self.ops.plan_add(
+                            body.get("title") or "",
+                            after=int(body["after"]) if body.get("after") else None,
+                            note=body.get("note") or "")}
+                    elif sub == "set":
+                        result = {"step": self.ops.plan_set(
+                            int(body.get("n") or 0), body.get("status") or "done",
+                            body.get("note") or "")}
+                    elif sub == "link":
+                        result = {"step": self.ops.plan_link(
+                            int(body.get("n") or 0), body.get("intent") or "")}
+                    elif sub == "state":
+                        result = self.ops.plan_state()
+                    else:
+                        raise ValueError(f"未知的计划动作 {sub!r}")
+                    self._audit(f"plan.{sub}", str(body.get("n") or ""), True)
+                    self._json({"ok": True, **result})
                 elif action == "armory":
                     sub = (body.get("action") or "").strip()
+                    prof = body.get("profile") or []
+                    if isinstance(prof, str):
+                        prof = [t.strip() for t in prof.split(",") if t.strip()]
                     if sub == "use":
                         result = self.ops.armory_use(body.get("weapon") or "",
-                                                     body.get("vid") or None)
+                                                     body.get("vid") or None, prof)
                     elif sub == "report":
                         result = self.ops.armory_report(
                             body.get("weapon") or "", body.get("vid") or "",
-                            body.get("result") or "ok")
+                            body.get("result") or "ok", prof, body.get("note") or "")
+                    elif sub == "attribute":
+                        result = self.ops.armory_attribute(
+                            body.get("weapon") or "", prof)
+                    elif sub == "derive":
+                        result = self.ops.armory_derive(
+                            body.get("weapon") or "", body.get("vid") or "v1", prof,
+                            apply=bool(body.get("apply")),
+                            top=int(body.get("top") or 2))
+                    elif sub == "recommend":
+                        result = self.ops.armory_recommend(
+                            prof, family=body.get("family") or "",
+                            keyword=body.get("keyword") or "",
+                            limit=int(body.get("limit") or 5))
                     elif sub == "add":
                         result = self.ops.armory_add(body)
                     elif sub == "seed":

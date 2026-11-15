@@ -1,0 +1,981 @@
+{
+  "_doc": "免杀/规避层注册表。cat 工程类别；cost 落地成本(1-3)；risk 静态特征风险(0-3)；beats 这层设计上克制哪些防护；detect 哪些防护仍能抓到它；needs 前置层；conflicts 互斥层。beats 与 detect 同时存在是常态——能克制 Cuckoo 的层往往也被新版 Cuckoo 检出。 applies 表示适用于 payload(载荷投递) 还是 traffic(流量层)。",
+  "version": 1,
+  "layers": [
+    {
+      "id": "obf.string-enc",
+      "cat": "obfuscate",
+      "name": "字符串常量加密",
+      "tool": "自定义 / Donut -e",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "av-heuristic"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "把 URL/命令/API 名从明文中移出；运行时解密，栈上拼接可再降一档",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "obf.control-flow",
+      "cat": "obfuscate",
+      "name": "控制流平坦化",
+      "tool": "OLLVM / Tigress",
+      "cost": 3,
+      "risk": 1,
+      "detect": [
+        "static-yara"
+      ],
+      "needs": [],
+      "conflicts": [
+        "pack.upx"
+      ],
+      "hint": "破坏 CFG 让反编译不可读；与 UPX 同用会显著增大体积且更可疑",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "obf.api-hashing",
+      "cat": "obfuscate",
+      "name": "API 名哈希动态解析",
+      "tool": "自定义 PEB 遍历",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "导入表里不出现敏感 API；对导入表启发式最有效",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "obf.import-strip",
+      "cat": "obfuscate",
+      "name": "导入表擦除/重建",
+      "tool": "pe-bear / LIEF",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "import-table-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "只留 kernel32.LoadLibrary/GetProcAddress，其余运行时解析",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "obf.string-stack",
+      "cat": "obfuscate",
+      "name": "字符串栈上拼装",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "memory-scan"
+      ],
+      "needs": [
+        "obf.string-enc"
+      ],
+      "conflicts": [],
+      "hint": "解密后立刻入栈而非停留堆上，规避内存特征扫描",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "adb.anti-debug",
+      "cat": "anti-decompile",
+      "name": "反调试（PEB/IsDebuggerPresent）",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "sandbox-cuckoo",
+        "edr"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "只挡手工分析，对自动化沙箱基本无效；作为第一层成本极低",
+      "beats": [
+        "manual-analysis"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "adb.timing",
+      "cat": "anti-decompile",
+      "name": "时间差/rdtsc 检测",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 0,
+      "detect": [
+        "sandbox-cuckoo",
+        "emulator"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "单步与模拟环境的时间差明显；建议与 sb.sleep-skip 成对使用",
+      "beats": [
+        "sandbox-cuckoo",
+        "emulator"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "adb.hwbp",
+      "cat": "anti-decompile",
+      "name": "硬件断点检测",
+      "tool": "GetThreadContext",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "edr"
+      ],
+      "needs": [
+        "adb.anti-debug"
+      ],
+      "conflicts": [],
+      "hint": "Dr0-Dr3 非零即认为被下断；对 x64dbg 现场分析很有效",
+      "beats": [
+        "manual-analysis"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "adb.anti-dump",
+      "cat": "anti-decompile",
+      "name": "反 dump（头部抹除/加密）",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "edr",
+        "memory-scan"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "内存中不留完整 PE 头，阻断 dump 后的静态分析",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "emulator"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "adb.vm-artifact",
+      "cat": "anti-decompile",
+      "name": "虚拟机痕迹枚举",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "磁盘型号/驱动/注册表键的黑名单；对商业沙箱命中率高",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "emulator"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "junk.jmp",
+      "cat": "junk-code",
+      "name": "跳转花指令",
+      "tool": "自定义汇编 / 插件",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "disasm-based"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "E9/E8 插入不可达字节，干扰线性反汇编；不干扰递归反汇编",
+      "beats": [
+        "static-yara",
+        "disasm-based"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "junk.dead-code",
+      "cat": "junk-code",
+      "name": "不可达垃圾指令段",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "static-yara"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "膨胀体积的同时污染特征串；注意别把熵拉高",
+      "beats": [
+        "static-yara",
+        "disasm-based"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "junk.fake-call",
+      "cat": "junk-code",
+      "name": "伪造调用栈",
+      "tool": "自定义",
+      "cost": 3,
+      "risk": 0,
+      "detect": [
+        "edr"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "让 EDR 的调用栈回溯指向合法模块；对行为检测有效，实现成本高",
+      "beats": [
+        "static-yara",
+        "disasm-based"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sb.sleep-skip",
+      "cat": "anti-sandbox",
+      "name": "睡眠加速检测",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 0,
+      "detect": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "sandbox-joe"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "sleep 60s 实际只过 2s 即判定沙箱；单层命中率最高、成本最低",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "sandbox-joe"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sb.human-check",
+      "cat": "anti-sandbox",
+      "name": "交互/人机检测",
+      "tool": "GetLastInputInfo",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "sandbox-cuckoo"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "无鼠标键盘活动则休眠；对无人值守沙箱有效，对真人分析无效",
+      "beats": [
+        "sandbox-cuckoo"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sb.resource-check",
+      "cat": "anti-sandbox",
+      "name": "资源规格检测",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 0,
+      "detect": [
+        "sandbox-cuckoo",
+        "sandbox-joe"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "CPU<2 核、内存<2G、磁盘<60G、分辨率异常 → 判定为沙箱",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "sandbox-joe",
+        "rate-limit"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sb.domain-check",
+      "cat": "anti-sandbox",
+      "name": "机器名/域名黑名单",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 0,
+      "detect": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "HAL9KA / SANDBOX / MALTEST / cuckoo 等主机名直接退出",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "sandbox-joe",
+        "rate-limit"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sb.time-accel",
+      "cat": "anti-sandbox",
+      "name": "时间加速检测",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 0,
+      "detect": [
+        "sandbox-cuckoo",
+        "emulator"
+      ],
+      "needs": [
+        "adb.timing"
+      ],
+      "conflicts": [],
+      "hint": "沙箱常加速时钟；比对 uptime 与本地计数可识别",
+      "beats": [
+        "sandbox-cuckoo",
+        "sandbox-anyrun",
+        "sandbox-joe",
+        "rate-limit"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "pack.upx",
+      "cat": "pack",
+      "name": "UPX 压缩壳",
+      "tool": "upx -9",
+      "cost": 1,
+      "risk": 3,
+      "detect": [
+        "static-yara",
+        "packing-detector",
+        "av-heuristic"
+      ],
+      "needs": [],
+      "conflicts": [
+        "obf.control-flow"
+      ],
+      "hint": "最容易被静态识别的一层；只适合临时验证，不要作为最终形态",
+      "beats": [
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "pack.custom",
+      "cat": "pack",
+      "name": "私有壳/自解密 stub",
+      "tool": "自定义 / 商业壳",
+      "cost": 3,
+      "risk": 1,
+      "detect": [
+        "packing-detector",
+        "memory-scan"
+      ],
+      "needs": [
+        "ent.pad"
+      ],
+      "conflicts": [],
+      "hint": "自写 stub 比商业壳更少被特征覆盖；注意 stub 自身的熵",
+      "beats": [
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "pack.section-perm",
+      "cat": "pack",
+      "name": "段权限调整",
+      "tool": "LIEF / pe-bear",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "memory-scan",
+        "edr"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "RWX 段是强特征；改成 RW→RX 两步，运行时再改回",
+      "beats": [
+        "memory-scan"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "pack.overlay",
+      "cat": "pack",
+      "name": "附加数据区隐藏",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 2,
+      "detect": [
+        "static-yara"
+      ],
+      "needs": [],
+      "conflicts": [
+        "sign.valid-cert"
+      ],
+      "hint": "藏在 overlay 或证书区；与有效签名互斥（签名会覆盖该区）",
+      "beats": [
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "fileless.memfd",
+      "cat": "fileless",
+      "name": "memfd 内存执行（Linux）",
+      "tool": "memfd_create + fexecve",
+      "cost": 2,
+      "risk": 0,
+      "detect": [],
+      "needs": [],
+      "conflicts": [],
+      "hint": "磁盘零落地；/proc/PID/exe 指向 /memfd: 仍是可观测点",
+      "beats": [
+        "static-yara",
+        "file-scan"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "fileless.srdi",
+      "cat": "fileless",
+      "name": "反射式加载（sRDI/DLL）",
+      "tool": "sRDI / Donut",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "memory-scan",
+        "edr"
+      ],
+      "needs": [
+        "obf.string-enc"
+      ],
+      "conflicts": [],
+      "hint": "无 LoadLibrary 调用；内存中的 PE 头是主要特征",
+      "beats": [
+        "static-yara",
+        "import-table-check"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "fileless.hollowing",
+      "cat": "fileless",
+      "name": "进程镂空/替换",
+      "tool": "自定义",
+      "cost": 3,
+      "risk": 2,
+      "detect": [
+        "edr",
+        "behavior-monitor"
+      ],
+      "needs": [
+        "adb.anti-debug"
+      ],
+      "conflicts": [],
+      "hint": "行为链明显（CreateProcess suspended → Unmap → Write）；需配伪造调用栈",
+      "beats": [
+        "file-scan",
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "fileless.apc",
+      "cat": "fileless",
+      "name": "APC 注入",
+      "tool": "自定义",
+      "cost": 3,
+      "risk": 2,
+      "detect": [
+        "edr"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "跨进程写入会触发 EDR；同进程 APC 风险低得多",
+      "beats": [
+        "file-scan",
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "fileless.registry",
+      "cat": "fileless",
+      "name": "注册表/计划任务驻留",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 2,
+      "detect": [
+        "edr",
+        "behavior-monitor"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "持久化动作本身就是强行为特征；短任务不必驻留",
+      "beats": [
+        "file-scan",
+        "static-yara"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sign.valid-cert",
+      "cat": "sign",
+      "name": "有效代码签名证书",
+      "tool": "EV/OV 证书 + signtool",
+      "cost": 3,
+      "risk": 0,
+      "detect": [],
+      "needs": [],
+      "conflicts": [
+        "pack.overlay"
+      ],
+      "hint": "对 SmartScreen/驱动加载最有效；证书本身要能和样本语义对上",
+      "beats": [
+        "av-heuristic",
+        "smartscreen",
+        "cert-blocklist"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sign.stolen-cert",
+      "cat": "sign",
+      "name": "泄露证书签名",
+      "tool": "signtool + 已泄露 pfx",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "cert-blocklist"
+      ],
+      "needs": [],
+      "conflicts": [
+        "pack.overlay"
+      ],
+      "hint": "多数已被吊销并进黑名单；用前先查吊销状态",
+      "beats": [
+        "av-heuristic",
+        "smartscreen"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sign.catalog",
+      "cat": "sign",
+      "name": "catalog 签名",
+      "tool": "inf2cat / 自制 catalog",
+      "cost": 3,
+      "risk": 1,
+      "detect": [
+        "catalog-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "让无内嵌签名的文件也显式受信；需管理员安装 catalog",
+      "beats": [
+        "av-heuristic",
+        "smartscreen"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "sign.timestamp",
+      "cat": "sign",
+      "name": "时间戳附带",
+      "tool": "signtool /tr",
+      "cost": 1,
+      "risk": 0,
+      "detect": [],
+      "needs": [
+        "sign.valid-cert"
+      ],
+      "conflicts": [],
+      "hint": "证书过期后签名仍有效；成本极低，只要签名就顺手加",
+      "beats": [
+        "av-heuristic",
+        "smartscreen"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "ent.pad",
+      "cat": "entropy",
+      "name": "段填充降熵",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "entropy-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "高熵段是加壳强特征；零填充或重复模式把整体熵压到 6.5 以下",
+      "beats": [
+        "entropy-check",
+        "packing-detector"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "ent.split",
+      "cat": "entropy",
+      "name": "载荷分片",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "entropy-check",
+        "size-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "拆成多段低熵数据，运行时重组；单段体积也变小",
+      "beats": [
+        "entropy-check",
+        "packing-detector"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "ent.base64-xor",
+      "cat": "entropy",
+      "name": "编码+异或组合",
+      "tool": "自定义",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "entropy-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "base64 降熵、xor 破结构；单独用都容易被还原，组合才有效",
+      "beats": [
+        "entropy-check",
+        "packing-detector"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "ent.resource",
+      "cat": "entropy",
+      "name": "载荷藏入资源段",
+      "tool": "rcedit / 自定义",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "static-yara",
+        "entropy-check"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "资源段天然可放二进制且不显眼；注意资源大小异常也是特征",
+      "beats": [
+        "entropy-check",
+        "packing-detector"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "ent.delay-decrypt",
+      "cat": "entropy",
+      "name": "延迟解密",
+      "tool": "自定义",
+      "cost": 2,
+      "risk": 0,
+      "detect": [
+        "memory-scan"
+      ],
+      "needs": [
+        "ent.split"
+      ],
+      "conflicts": [],
+      "hint": "静态时全低熵，运行时才出现高熵页；对静态扫描很有效",
+      "beats": [
+        "entropy-check",
+        "packing-detector"
+      ],
+      "applies": [
+        "payload"
+      ]
+    },
+    {
+      "id": "tr.ua-rotate",
+      "cat": "traffic",
+      "name": "UA/请求头轮换",
+      "tool": "自定义 / ffuf -H",
+      "cost": 1,
+      "risk": 1,
+      "detect": [
+        "waf",
+        "ids"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "固定 UA 是最廉价的指纹；轮换时保持与目标客户端一致，别随机到不存在的版本",
+      "beats": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    },
+    {
+      "id": "tr.jitter",
+      "cat": "traffic",
+      "name": "请求间隔抖动",
+      "tool": "令牌桶 + 随机化",
+      "cost": 1,
+      "risk": 0,
+      "detect": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "等间隔请求本身就是机器特征；300-1200ms 随机 + 偶发长停顿最像人",
+      "beats": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    },
+    {
+      "id": "tr.frag",
+      "cat": "traffic",
+      "name": "分片/慢速发送",
+      "tool": "自定义 socket / --delay",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "waf",
+        "ids"
+      ],
+      "needs": [
+        "tr.jitter"
+      ],
+      "conflicts": [],
+      "hint": "把 payload 拆到多个参数或多次请求；对基于单请求匹配的 WAF 有效",
+      "beats": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    },
+    {
+      "id": "tr.payload-morph",
+      "cat": "traffic",
+      "name": "载荷编码变形",
+      "tool": "tamper / 手写",
+      "cost": 2,
+      "risk": 1,
+      "detect": [
+        "waf",
+        "static-yara"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "大小写/注释/等价函数/嵌套编码；变形要保证语义不变，别把 payload 改坏",
+      "beats": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    },
+    {
+      "id": "tr.tls-fp",
+      "cat": "traffic",
+      "name": "TLS/JA3 指纹伪装",
+      "tool": "curl_cffi / uTLS",
+      "cost": 2,
+      "risk": 0,
+      "detect": [
+        "edr",
+        "ids"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "Python requests 的 JA3 是显式指纹；用 curl_cffi impersonate 浏览器栈",
+      "beats": [
+        "ids",
+        "edr"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    },
+    {
+      "id": "tr.proxy-chain",
+      "cat": "traffic",
+      "name": "出口代理链",
+      "tool": "proxychains / 自建",
+      "cost": 2,
+      "risk": 0,
+      "detect": [
+        "ids",
+        "ip-reputation"
+      ],
+      "needs": [],
+      "conflicts": [],
+      "hint": "换出口能解决 IP 封禁，但解决不了 payload 特征——两者别混为一谈",
+      "beats": [
+        "waf",
+        "ids",
+        "rate-limit"
+      ],
+      "applies": [
+        "traffic"
+      ]
+    }
+  ],
+  "categories": {
+    "obfuscate": "混淆",
+    "anti-decompile": "反编译/反调试",
+    "junk-code": "花指令",
+    "anti-sandbox": "抗沙盒",
+    "pack": "加壳",
+    "fileless": "不落盘",
+    "sign": "签名",
+    "entropy": "降熵",
+    "traffic": "流量层"
+  },
+  "profiles": {
+    "_doc": "目标画像标签，用于按防护产品调权。recommend 时用 --profile 逗号分隔。",
+    "windows": "Windows 目标",
+    "linux": "Linux 目标",
+    "defender": "Windows Defender",
+    "edr": "有 EDR/行为监控",
+    "sandbox-cuckoo": "Cuckoo 类沙箱",
+    "sandbox-anyrun": "ANY.RUN 类沙箱",
+    "sandbox-joe": "Joe Sandbox 类",
+    "static-yara": "静态 YARA 规则集",
+    "entropy-check": "熵值检测",
+    "packing-detector": "加壳检测",
+    "memory-scan": "内存扫描",
+    "behavior-monitor": "行为监控/HIPS",
+    "cert-blocklist": "证书黑名单校验",
+    "import-table-check": "导入表启发式",
+    "offline": "无外网",
+    "waf": "WAF",
+    "ids": "IDS/IPS",
+    "rate-limit": "速率限制",
+    "ip-reputation": "IP 信誉库"
+  }
+}

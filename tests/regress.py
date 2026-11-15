@@ -514,7 +514,10 @@ def armory_basic():
         env = armory_env(work)
         run("armory", "seed", cwd=work, env=env)
         listing = run("armory", "list", cwd=work, env=env).stdout
-        assert "w001" in listing and "共 4 项" in listing, f"list 输出异常:\n{listing[:400]}"
+        rows = [ln for ln in listing.splitlines() if ln.startswith("w")]
+        assert "w001" in listing, f"list 输出异常:\n{listing[:400]}"
+        assert f"共 {len(rows)} 项" in listing, f"计数与行数不一致:\n{listing[:400]}"
+        assert len(rows) >= 4, f"种子武器应至少 4 把，实际 {len(rows)}"
 
         hits = run("armory", "search", "tomcat", cwd=work, env=env).stdout
         assert "w001" in hits and "Ghostcat" in hits, f"search 输出异常:\n{hits}"
@@ -966,6 +969,251 @@ def chat_tools():
 
 
 # --------------------------------------------------------------------------- #
+# evasion layers (payload vs detection engineering)
+# --------------------------------------------------------------------------- #
+@case("evasion: 注册表完整、分类齐全、层字段可信")
+def evasion_registry():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import evasion as ev
+
+    reg = ev.registry()
+    layers = reg["layers"]
+    assert len(layers) >= 30, f"层数过少: {len(layers)}"
+    cats = ev.categories()
+    for required in ("obfuscate", "anti-decompile", "junk-code", "anti-sandbox",
+                     "pack", "fileless", "sign", "entropy"):
+        assert required in cats, f"缺少类别 {required}"
+    for layer in layers:
+        for field in ("id", "cat", "name", "cost", "risk", "hint"):
+            assert field in layer, f"{layer.get('id')} 缺字段 {field}"
+        assert layer["cat"] in cats, f"{layer['id']} 分类 {layer['cat']} 未登记"
+        assert 1 <= int(layer["cost"]) <= 3, f"{layer['id']} cost 越界"
+        assert 0 <= int(layer["risk"]) <= 3, f"{layer['id']} risk 越界"
+        assert layer.get("applies") in (["payload"], ["traffic"]), layer["id"]
+
+
+@case("evasion: 栈校验能拦住未知/缺前置/互斥")
+def evasion_validate():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import evasion as ev
+
+    assert any("未知层" in p for p in ev.validate_stack(["no.such.layer"]))
+
+    # sign.timestamp 依赖 sign.valid-cert
+    problems = ev.validate_stack(["sign.timestamp"])
+    assert any("需要前置层" in p for p in problems), problems
+
+    # UPX 与控制流平坦化互斥（同时上会互相抵消且更可疑）
+    problems = ev.validate_stack(["pack.upx", "obf.control-flow"])
+    assert any("互斥" in p for p in problems), problems
+
+    # 合法栈无问题
+    assert ev.validate_stack(["obf.string-enc", "fileless.srdi"]) == []
+
+    # 重复层
+    assert any("重复" in p for p in ev.validate_stack(["obf.string-enc", "obf.string-enc"]))
+
+
+@case("evasion: 结构先验不允许裸载荷排第一")
+def evasion_prior():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import evasion as ev
+
+    profile = ["defender", "sandbox-cuckoo", "packing-detector"]
+    naked = ev.prior_confidence([], profile)
+    light = ev.prior_confidence(
+        ["obf.string-enc", "obf.import-strip", "fileless.srdi"], profile)
+    heavy = ev.prior_confidence(
+        ["obf.string-enc", "obf.import-strip", "fileless.srdi",
+         "sb.sleep-skip", "sb.resource-check", "junk.jmp",
+         "ent.pad", "sign.valid-cert"], profile)
+    assert naked < light < heavy, (naked, light, heavy)
+    assert 0.05 <= naked <= 0.35, naked
+
+    # UPX 对加壳检测是负资产：加它不能比不加更高
+    without = ev.prior_confidence(["obf.string-enc"], ["packing-detector"])
+    with_upx = ev.prior_confidence(["obf.string-enc", "pack.upx"], ["packing-detector"])
+    assert with_upx <= without + 0.001, (without, with_upx)
+
+
+@case("evasion: 归因需要对照，共线要标出来")
+def evasion_attribution():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import evasion as ev
+
+    # 三个抗沙盒层总是一起出现 → 共线
+    trio = ["sb.sleep-skip", "sb.resource-check", "sb.domain-check"]
+    attempts = [
+        {"stack": [], "result": "blocked"},
+        {"stack": trio, "result": "ok"},
+        {"stack": trio, "result": "ok"},
+        {"stack": ["obf.string-enc"], "result": "blocked"},
+    ]
+    rows = {r["layer"]: r for r in ev.attribute(attempts)}
+    for lid in trio:
+        assert rows[lid]["collinear_with"], f"{lid} 应标记共线"
+        assert rows[lid]["lift"] is not None, lid
+    assert not rows["obf.string-enc"]["collinear_with"], rows["obf.string-enc"]
+
+    # 只在成功的栈里出现、且从无对照 → 不可归因
+    lonely = [{"stack": ["ent.pad"], "result": "ok"},
+              {"stack": ["ent.pad"], "result": "ok"}]
+    rows = {r["layer"]: r for r in ev.attribute(lonely)}
+    assert rows["ent.pad"]["attributable"] is False, rows["ent.pad"]
+    assert "无对照" in ev.render_attribution(list(rows.values()))
+
+
+@case("evasion: 派生只提可用的层，并带上前置")
+def evasion_derive():
+    sys.path.insert(0, str(ROOT / "lib"))
+    import evasion as ev
+
+    attempts = [
+        {"stack": [], "result": "blocked"},
+        {"stack": ["obf.string-enc", "fileless.srdi"], "result": "ok"},
+        {"stack": ["obf.string-enc", "fileless.srdi"], "result": "ok"},
+        {"stack": ["pack.upx"], "result": "blocked"},
+    ]
+    cands = ev.derive_candidates(["pack.upx"], attempts, ["packing-detector"],
+                                 scope="payload")
+    ids = [c["layer"] for c in cands]
+    assert "pack.upx" not in ids, "已在该栈里的层不该再被建议"
+    assert all(not lid.startswith("tr.") for lid in ids), f"载荷武器不该出流量层: {ids}"
+    assert any("srdi" in lid or "string-enc" in lid for lid in ids), ids
+
+    # 前置层成套：sign.timestamp 必须带上 sign.valid-cert
+    cands = ev.derive_candidates([], [], [], scope="payload", limit=40)
+    ts = next((c for c in cands if c["layer"] == "sign.timestamp"), None)
+    if ts:
+        assert "sign.valid-cert" in (ts.get("bundle") or []), ts
+
+    # 流量武器只出流量层
+    cands = ev.derive_candidates([], [], [], scope="traffic", limit=40)
+    assert cands and all(c["layer"].startswith("tr.") for c in cands), cands
+
+
+@case("armory: 栈随战绩记录，按画像推荐不选裸载荷")
+def armory_evasion_flow():
+    work = fresh()
+    try:
+        env = armory_env(work)
+        run("armory", "seed", cwd=work, env=env)
+        profile = "defender,sandbox-cuckoo,packing-detector"
+
+        # 裸的、少层的被拦；多层沙箱栈通过
+        for vid, result in (("v1", "blocked"), ("v2", "blocked"),
+                            ("v3", "blocked"), ("v4", "ok"), ("v4", "ok")):
+            run("armory", "report", "w005", "--vid", vid, "--result", result,
+                "--profile", profile, cwd=work, env=env)
+
+        out = run("armory", "recommend", "--profile", profile,
+                  "--family", "payload", cwd=work, env=env).stdout
+        assert "w005/" in out, out
+        first = [ln for ln in out.splitlines() if ln.strip().startswith(("1.", "!1."))]
+        assert first and "w005/v1" not in first[0], f"不应推荐裸载荷: {first}"
+
+        # 栈被写进变体，报告后 attempts 有记录
+        data = read_json(work / "armory" / "w005.json")
+        assert data["attempts"], "战绩未写入 attempts"
+        assert len(data["attempts"][0]["stack"]) == 0
+        assert data["attempts"][3]["stack"], "v4 的栈应为非空"
+        assert data["attempts"][3]["profile"] == profile.split(",")
+
+        # 归因表能算
+        attr = run("armory", "attribute", "w005", "--profile", profile,
+                   cwd=work, env=env).stdout
+        assert "lift" in attr and "共线" in attr, attr[:300]
+
+        # 派生 + 应用：新变体继承原栈并加上建议层
+        derived = run("armory", "derive", "w005", "--vid", "v3",
+                      "--profile", profile, "--apply", "1",
+                      cwd=work, env=env).stdout
+        assert "已派生" in derived, derived
+        after = read_json(work / "armory" / "w005.json")
+        new = [v for v in after["variants"] if v.get("derived_from") == "v3"]
+        assert new, "未生成派生变体"
+        assert len(new[0]["stack"]) > 3, new[0]["stack"]
+        assert after["derived"][-1]["from"] == "v3"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# plan (long-running, multi-step chains)
+# --------------------------------------------------------------------------- #
+@case("plan: 建步骤/前置/状态机，同时只有一步在进行")
+def plan_basic():
+    work = fresh()
+    try:
+        run("plan", "add", "发现注入点", cwd=work)
+        run("plan", "add", "取凭据", "--after", "1", cwd=work)
+        run("plan", "add", "横向", "--after", "2", cwd=work)
+
+        listed = run("plan", "list", cwd=work).stdout
+        assert "1. 发现注入点" in listed and "(前置 1)" in listed, listed
+        assert "可派" in listed, listed            # only step 1 is ready
+
+        run("plan", "set", "1", "done", cwd=work)
+        listed = run("plan", "list", cwd=work).stdout
+        assert "可派: 2" in listed or "2.取凭据" in listed.replace(" ", ""), listed
+
+        # 第二步开始后，再让第三步开始：只能有一个 doing
+        run("plan", "set", "2", "doing", cwd=work)
+        run("plan", "set", "3", "doing", cwd=work)
+        data = read_json(work / ".sapper" / "plan.json")
+        doing = [s["n"] for s in data["steps"] if s["status"] == "doing"]
+        assert doing == [3], f"应只有第 3 步在进行: {doing}"
+
+        # 阻塞要留原因，且不能算可派
+        run("plan", "set", "3", "blocked", "--note", "缺 hash", cwd=work)
+        data = read_json(work / ".sapper" / "plan.json")
+        step3 = [s for s in data["steps"] if s["n"] == 3][0]
+        assert step3["status"] == "blocked" and step3["note"] == "缺 hash", step3
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("plan: 关联 intent 收尾后自动推进；无依赖不阻塞")
+def plan_sync():
+    work = fresh()
+    try:
+        run("fact", "-t", "注入点", "-k", "vuln", "确认", cwd=work)
+        run("plan", "add", "读配置", cwd=work)
+        run("intent", "--from", "f001", "-t", "读配置", "拿凭据", cwd=work)
+        run("claim", "i001", "--worker", "w", cwd=work)
+        run("done", "i001", "--worker", "w", "--fact", "拿到凭据", "-k", "cred", cwd=work)
+        run("plan", "link", "1", "i001", cwd=work)
+
+        listed = run("plan", "list", cwd=work).stdout
+        assert "✔" in listed and "读配置" in listed, listed
+        assert "100.0%" in listed or "1/1" in listed, listed
+
+        # 计划块进入 commander 提示词（跨唤醒记忆的关键）
+        prompt = run("dispatch", "reason", "--dry-run", cwd=work).stdout
+        assert "规划待办" in prompt, "提示词缺少计划块"
+        assert "读配置" in prompt, "提示词缺少步骤内容"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("plan: 空计划不污染提示词，非法编号给可读错误")
+def plan_edges():
+    work = fresh()
+    try:
+        prompt = run("dispatch", "reason", "--dry-run", cwd=work).stdout
+        assert "还没有规划待办" in prompt, prompt[:200]
+
+        proc = run("plan", "set", "9", "done", cwd=work, check=False)
+        assert proc.returncode != 0, "不存在的步骤应失败"
+        assert "Traceback" not in (proc.stderr or ""), proc.stderr
+
+        proc = run("plan", "add", "   ", cwd=work, check=False)
+        assert proc.returncode != 0 and "Traceback" not in (proc.stderr or "")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 TOKEN = os.environ.setdefault("SAPPER_CONSOLE_TOKEN", "regress-token-please-change")
@@ -1171,6 +1419,47 @@ def serve_write_ops():
             still = read_json(work / ".sapper" / "intents" / f"{iid3}.json")
             assert still["to"] is None and still["status"] == "open", still
 
+            # 免杀栈接口：画像参数、归因、派生、计划
+            arm2 = json.loads(http_call(
+                port, "GET", "/api/armory?profile=defender,packing-detector",
+                headers=AUTH)[1])
+            w5 = next(w for w in arm2["weapons"] if w["id"] == "w005")
+            assert arm2["profile"] == ["defender", "packing-detector"], arm2["profile"]
+            assert any(v.get("stack") for v in w5["variants"]), "变体应带免杀栈"
+            assert w5["variants"][0].get("estimate") is not None
+
+            # 归因接口：没有战绩时应返回空表而不是报错；有战绩后才有行
+            empty_attr = json.loads(http_call(
+                port, "GET", "/api/armory/w005/attribute?profile=defender",
+                headers=AUTH)[1])
+            assert empty_attr["rows"] == [], empty_attr
+            for vid, result in (("v1", "blocked"), ("v3", "ok"), ("v4", "ok")):
+                http_call(port, "POST", "/api/ops/armory", {
+                    "action": "report", "weapon": "w005", "vid": vid,
+                    "result": result, "profile": ["defender"]}, headers=AUTH)
+            attr = json.loads(http_call(
+                port, "GET", "/api/armory/w005/attribute?profile=defender",
+                headers=AUTH)[1])
+            assert attr["rows"], attr
+            assert any(r["layer"] for r in attr["rows"])
+
+            plan0 = json.loads(http_call(port, "GET", "/api/plan", headers=AUTH)[1])
+            assert plan0["steps"] == [], plan0
+            added = json.loads(http_call(port, "POST", "/api/ops/plan", {
+                "action": "add", "title": "第一步"}, headers=AUTH)[1])
+            assert added["step"]["n"] == 1, added
+            done = json.loads(http_call(port, "POST", "/api/ops/plan", {
+                "action": "set", "n": 1, "status": "done"}, headers=AUTH)[1])
+            assert done["step"]["status"] == "done", done
+            plan1 = json.loads(http_call(port, "GET", "/api/plan", headers=AUTH)[1])
+            assert plan1["progress"]["percent"] == 100.0, plan1["progress"]
+
+            # 会话不能派生执行（没有 --allow-exec）：exec 门的另一条验证
+            code, _ = http_call(port, "POST", "/api/ops/armory", {
+                "action": "derive", "weapon": "w005", "vid": "v1",
+                "apply": True}, headers=AUTH)
+            assert code == 200, code
+
             # 审计日志：每次写操作留痕且带哈希链
             lines = (work / ".sapper" / "audit.jsonl").read_text(encoding="utf-8").splitlines()
             assert len(lines) >= 4, lines
@@ -1201,6 +1490,9 @@ SUITES = {
     "assets": [assets_ingest, assets_cross_task, assets_rebuild],
     "traffic": [traffic_filter, traffic_query, traffic_clear_guard],
     "chat": [chat_tools],
+    "evasion": [evasion_registry, evasion_validate, evasion_prior,
+                evasion_attribution, evasion_derive, armory_evasion_flow],
+    "plan": [plan_basic, plan_sync, plan_edges],
     "serve": [serve_readonly, serve_write_ops],
 }
 
