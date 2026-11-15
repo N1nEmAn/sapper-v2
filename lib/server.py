@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import assets  # noqa: E402
 import index_db  # noqa: E402
+import traffic  # noqa: E402
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -134,6 +135,35 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "not found", "key": key}, 404)
                 else:
                     self._json(row)
+                return
+
+            if route == "/api/traffic":
+                qs = parse_qs(parsed.query)
+                assert self.db_path is not None
+                store = traffic.TrafficStore(self.db_path.parent)
+                if not store.available():
+                    self._json({"available": False, "rows": [], "stats": {"total": 0}})
+                    return
+                limit = int((qs.get("limit") or ["100"])[0])
+                status_raw = (qs.get("status") or [None])[0]
+                rows = store.list(
+                    host=(qs.get("host") or [None])[0],
+                    status=int(status_raw) if status_raw else None,
+                    q=(qs.get("q") or [None])[0],
+                    limit=limit,
+                )
+                self._json({"available": True, "rows": rows, "stats": store.stats()})
+                return
+
+            if route.startswith("/api/traffic/"):
+                raw = route.rsplit("/", 1)[-1]
+                assert self.db_path is not None
+                store = traffic.TrafficStore(self.db_path.parent)
+                rec = store.get(int(raw)) if raw.isdigit() and store.available() else None
+                if rec is None:
+                    self._json({"error": "not found", "id": raw}, 404)
+                else:
+                    self._json(rec)
                 return
 
             # static assets under web/

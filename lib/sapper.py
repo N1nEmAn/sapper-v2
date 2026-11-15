@@ -3337,6 +3337,80 @@ def cmd_assets(args) -> int:
     raise FGError(f"未知的 assets 动作 {action!r}；可用: list/search/show/stats/forget/rebuild/seed")
 
 
+def cmd_traffic(args) -> int:
+    """Captured HTTP traffic: list/search/show/stats/clear/import."""
+    store = Store(Path(args.store))
+    store.require()
+    mod = _load_lib("traffic", "traffic.py")
+    ts = mod.TrafficStore(store.root)
+    action = (args.traffic_action or "list").lower()
+
+    if action == "stats":
+        st = ts.stats()
+        span = f"{st['first'] or '-'} .. {st['last'] or '-'}"
+        print(f"traffic: {st['total']} 条 / {st['hosts']} 个主机  {span}")
+        for code, n in st["by_status"].items():
+            print(f"  {code:<5} {n}")
+        print(f"db: {ts.path.resolve()}")
+        return 0
+
+    if action == "import":
+        if not args.file:
+            raise FGError("traffic import 需要 --file <records.json>")
+        path = Path(args.file)
+        if not path.is_file():
+            raise FGError(f"文件不存在: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise FGError(f"无法解析 JSON: {exc}")
+        records = payload if isinstance(payload, list) else payload.get("records", [])
+        if not isinstance(records, list):
+            raise FGError("JSON 应为记录数组，或 {\"records\": [...]}")
+        result = mod.import_records(ts, records)
+        print(f"imported {result['kept']} kept, {result['dropped']} dropped")
+        for reason, n in sorted(result["reasons"].items(), key=lambda kv: -kv[1]):
+            print(f"  - {reason}: {n}")
+        return 0
+
+    if action == "clear":
+        if not args.all:
+            raise FGError("traffic clear 需要 --all 确认（证据一旦删除无法恢复）")
+        n = ts.clear()
+        print(f"已删除 {n} 条流量记录")
+        return 0
+
+    if action == "show":
+        if not args.target or not args.target.isdigit():
+            raise FGError("traffic show 需要流量 id（数字）")
+        rec = ts.get(int(args.target))
+        if rec is None:
+            raise FGError(f"流量 {args.target} 不存在")
+        print(json.dumps(rec, ensure_ascii=False, indent=2))
+        return 0
+
+    if action in ("list", "search"):
+        if not ts.available():
+            print("(还没有流量记录。抓包: mitmdump -s tools/mitm_sapper.py --set sapper_db=<项目>/.sapper)")
+            return 0
+        q = args.target if action == "search" else None
+        if action == "search" and not q:
+            raise FGError("traffic search 需要关键词")
+        rows = ts.list(host=args.host, status=args.status, q=q, limit=args.limit)
+        if not rows:
+            print("(无匹配流量)")
+            return 0
+        for r in rows:
+            tags = ",".join(t for t in r["tags"] if t)
+            line = (f"{r['id']:>5}  {str(r['status'] or '-'):<4} {r['method']:<6} "
+                    f"{(r['host'] or '') + r['path']}")
+            print("  " + line[:96] + (f"   [{tags}]" if tags else ""))
+        print(f"-- {len(rows)} 条")
+        return 0
+
+    raise FGError(f"未知的 traffic 动作 {action!r}；可用: list/search/show/stats/clear/import")
+
+
 def cmd_serve(args) -> int:
     """Web console over the SQLite index. Read-only, cannot corrupt the graph."""
     store = Store(Path(args.store))
@@ -5078,6 +5152,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--record", action="store_true",
                     help="write a fact when findings exist")
     sp.set_defaults(func=cmd_audit)
+
+    sp = sub.add_parser("traffic", help="captured HTTP traffic from the MITM proxy")
+    sp.add_argument("traffic_action", nargs="?", default="list",
+                    choices=["list", "search", "show", "stats", "clear", "import"],
+                    help="default: list")
+    sp.add_argument("target", nargs="?", help="keyword (search) or traffic id (show)")
+    sp.add_argument("--host", help="filter by host substring (list)")
+    sp.add_argument("--status", type=int, help="filter by status code (list)")
+    sp.add_argument("--limit", type=int, default=100, help="max rows (default 100)")
+    sp.add_argument("--file", help="JSON array of records (import)")
+    sp.add_argument("--all", action="store_true", help="required confirmation (clear)")
+    sp.set_defaults(func=cmd_traffic)
 
     sp = sub.add_parser("assets", help="global asset store shared across engagements")
     sp.add_argument("assets_action", nargs="?", default="list",

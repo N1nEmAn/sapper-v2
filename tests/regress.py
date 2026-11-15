@@ -718,6 +718,94 @@ def assets_rebuild():
 
 
 # --------------------------------------------------------------------------- #
+# traffic (MITM capture)
+# --------------------------------------------------------------------------- #
+TRAFFIC_MIX = [
+    {"method": "GET", "url": "http://t.local/index.html", "path": "/index.html",
+     "host": "t.local", "status": 200, "mime": "text/html", "resp_size": 1200},
+    {"method": "GET", "url": "http://t.local/app.css", "path": "/app.css",
+     "host": "t.local", "status": 200, "mime": "text/css", "resp_size": 900},
+    {"method": "GET", "url": "http://t.local/api/user?id=1", "path": "/api/user",
+     "host": "t.local", "status": 200, "mime": "application/json", "resp_size": 88},
+    {"method": "GET", "url": "http://t.local/logo.png", "path": "/logo.png",
+     "host": "t.local", "status": 200, "mime": "image/png"},
+    {"method": "GET", "url": "http://t.local/x", "path": "/x",
+     "host": "t.local", "status": 304, "mime": "text/html"},
+    {"method": "POST", "url": "http://t.local/login", "path": "/login",
+     "host": "t.local", "status": 302, "mime": "text/html", "req_body": "user=a&pass=b"},
+    {"method": "GET", "url": "http://t.local/admin", "path": "/admin",
+     "host": "t.local", "status": 403, "mime": "text/html"},
+    {"method": "GET", "url": "http://t.local/boom", "path": "/boom",
+     "host": "t.local", "status": 500, "mime": "text/html"},
+    {"method": "GET", "url": "http://t.local/plain", "path": "/plain",
+     "host": "t.local", "status": 200, "mime": "text/plain"},
+]
+
+
+def write_traffic(work: Path, records: list[dict]) -> Path:
+    path = work / "flows.json"
+    path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+@case("traffic: 入库前过滤，静态与 304 丢弃")
+def traffic_filter():
+    work = fresh()
+    try:
+        out = run("traffic", "import", "--file", str(write_traffic(work, TRAFFIC_MIX)),
+                  cwd=work).stdout
+        assert "imported 6 kept, 3 dropped" in out, f"过滤结果不符:\n{out}"
+        assert "static: 2" in out and "not-modified: 1" in out, f"丢弃原因不符:\n{out}"
+
+        listing = run("traffic", cwd=work).stdout
+        for kept in ("/admin", "/login", "/api/user", "/boom", "/plain", "/index.html"):
+            assert kept in listing, f"应保留 {kept}:\n{listing}"
+        for dropped in ("/app.css", "/logo.png", "t.local/x"):
+            assert dropped not in listing, f"应丢弃 {dropped}:\n{listing}"
+        assert "state-changing" in listing, "POST /login 应标注 state-changing"
+        assert "error-surface" in listing, "403/500 应标注 error-surface"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("traffic: 按主机/状态码/关键词查询")
+def traffic_query():
+    work = fresh()
+    try:
+        run("traffic", "import", "--file", str(write_traffic(work, TRAFFIC_MIX)), cwd=work)
+
+        only_403 = run("traffic", "list", "--status", "403", cwd=work).stdout
+        assert "t.local/admin" in only_403 and "t.local/plain" not in only_403, only_403
+
+        assert "6 条" in run("traffic", "list", "--host", "t.local", cwd=work).stdout
+        assert "(无匹配流量)" in run("traffic", "list", "--host", "nope.local",
+                                    cwd=work).stdout
+
+        hit = run("traffic", "search", "boom", cwd=work).stdout
+        assert "t.local/boom" in hit and "1 条" in hit, hit
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@case("traffic: clear 必须显式 --all，且不产生 Traceback")
+def traffic_clear_guard():
+    work = fresh()
+    try:
+        run("traffic", "import", "--file", str(write_traffic(work, TRAFFIC_MIX)), cwd=work)
+
+        proc = run("traffic", "clear", cwd=work, check=False)
+        assert proc.returncode != 0 and "Traceback" not in proc.stderr, (
+            f"未确认的 clear 应被拒绝:\n{proc.stderr[:300]}"
+        )
+
+        out = run("traffic", "clear", "--all", cwd=work).stdout
+        assert "已删除 6 条" in out, out
+        assert "traffic: 0 条" in run("traffic", "stats", cwd=work).stdout
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # serve (read-only by default)
 # --------------------------------------------------------------------------- #
 @case("serve: 默认只读，POST 返回 403")
@@ -753,6 +841,12 @@ def serve_readonly():
                     time.sleep(0.3)
             assert health and health["ok"], "服务未能在 15s 内就绪"
 
+            for route in ("/api/assets", "/api/traffic"):
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}{route}", timeout=5
+                ) as resp:
+                    assert resp.status == 200, f"{route} 应返回 200"
+
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/api/confirm/i001", method="POST"
             )
@@ -784,6 +878,7 @@ SUITES = {
     "armory": [armory_basic, armory_scoring, armory_deprecate, armory_use_best,
                armory_done_link, armory_errors],
     "assets": [assets_ingest, assets_cross_task, assets_rebuild],
+    "traffic": [traffic_filter, traffic_query, traffic_clear_guard],
     "serve": [serve_readonly],
 }
 

@@ -342,6 +342,53 @@ P5 的三个硬点（已在 PLAN 里记过）：CA 信任、证书固定（pinni
 
 ---
 
+## P5 已完成：MITM 流量录制
+
+代理录制最大的坑不是抓不到，是**抓太多**：一个站点几万请求，直接入库三天就成垃圾场。
+所以过滤跑在入库之前，规则只有一张表：
+
+| 保留 | 丢弃 |
+|---|---|
+| POST/PUT/PATCH/DELETE（改状态）| `.css/.js/.png/.woff…` 静态资源 |
+| 401/403/500/502/503（错误面）| 304 未修改 |
+| 路径含 login/admin/api/graphql/.git/.env… | 其他 4xx 以外的不感兴趣响应 |
+| URL 含 `id= url= file= cmd= redirect=…` | |
+| 2xx/3xx 且 content-type 是 html/json/xml/text | |
+
+**存储独立成 `.sapper/traffic.db`**，不放进 `index.db`：重建事实索引不能顺手把证据删了。
+
+### 用法
+
+```bash
+# 抓包（需要 mitmproxy：pip install mitmproxy）
+mitmdump -p 8080 -s tools/mitm_sapper.py --set sapper_store=D:/work/target
+
+# 查询
+sapper traffic                     # 最近 100 条
+sapper traffic list --status 403
+sapper traffic list --host example.com
+sapper traffic search token
+sapper traffic show 12             # 完整请求/响应（body 截断 8KB）
+sapper traffic stats
+sapper traffic clear --all         # 必须显式 --all
+sapper traffic import --file flows.json   # 没有 mitmproxy 也能进（JSON 数组）
+```
+
+Web 控制台第三个页签「流量」：状态码着色（2xx 绿 / 3xx 蓝 / 4xx·5xx 红），
+点行看完整请求响应。接口：`GET /api/traffic`、`GET /api/traffic/<id>`。
+
+### 实测
+
+```
+9 条混合流量 import -> 6 kept, 3 dropped (static×2, not-modified×1)
+POST /login         -> [state-changing]
+/admin 403          -> [error-surface]
+/api/user?id=1      -> [hot-path]
+README 之外的硬限制：证书固定(pinning)的目标抓不到明文，这是 TLS 本身的性质，不是工具问题。
+```
+
+---
+
 ## 容器内验证（追加）
 
 ```
