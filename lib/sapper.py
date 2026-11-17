@@ -579,12 +579,17 @@ class Store:
             atomic_write_json(self.hints_dir / f"{hid}.json", hint)
             return hint
 
-    def update_flag_fact(self, fid: str, status: str, result_note: str | None) -> dict:
+    def update_flag_fact(self, fid: str, status: str, result_note: str | None,
+                         extra: dict | None = None) -> dict:
         """Lifecycle update for a flag fact: recorded -> submitted/rejected.
 
         Facts are immutable by convention; flags are the one exception because
         their submission status changes after the fact is written (crash-safe:
-        the capture is recorded first, the platform reply second)."""
+        the capture is recorded first, the platform reply second).
+
+        ``extra`` records platform-specific submit metadata (instance_id,
+        question_id, attempts_remaining, ...).  It is normalised like fact data
+        so a fact stays a flat key=value record."""
         with self.locked():
             fact = self.get_fact(fid)
             if fact.get("kind") != "flag":
@@ -595,6 +600,8 @@ class Store:
             data["status"] = status
             if result_note:
                 data["result"] = result_note
+            if extra:
+                data.update(normalize_fact_data(extra) or {})
             fact["data"] = normalize_fact_data(data)
             atomic_write_json(self.facts_dir / f"{fid}.json", fact)
             return fact
@@ -1745,13 +1752,43 @@ def _arena_client(store: Store):
         raise FGError(str(exc)) from exc
 
 
-def _find_flag_fact(store: Store, value: str) -> dict | None:
+def _find_flag_fact(store: Store, value: str, challenge: str = "",
+                    question_id: str = "") -> dict | None:
+    """Find an existing capture of the same answer.
+
+    With --question/--challenge given the match is narrowed, so the same
+    literal answer can legitimately be recorded against two different
+    questions (some challenge families reuse answer formats)."""
     for f in store.list_facts():
         if f.get("kind") != "flag":
             continue
-        if (f.get("data") or {}).get("value") == value:
-            return f
+        data = f.get("data") or {}
+        if data.get("value") != value:
+            continue
+        if challenge and data.get("challenge") and data["challenge"] != challenge:
+            continue
+        if question_id and data.get("question_id") and data["question_id"] != question_id:
+            continue
+        return f
     return None
+
+
+def _infer_challenge_from_store(store: Store) -> str:
+    """Derive <code> from a store rooted at <root>/<code>/.sapper."""
+    if store.root.name == ".sapper":
+        return store.root.parent.name
+    return ""
+
+
+# Errors that mean "the platform could not accept this yet" rather than
+# "this answer is wrong".  The capture stays recorded so finish_flags or a
+# later `sapper flag ... --submit` can retry it without re-recording.
+_DEFERRABLE_SUBMIT_CODES = {
+    "question_ambiguous", "no_open_question", "no_instance",
+    "instance_not_ready", "instance_starting", "question_locked",
+    "team_capacity_exceeded", "start_timeout", "platform_busy",
+    "competition_paused", "competition_not_in_session",
+}
 
 
 def cmd_flag(args) -> int:
@@ -1760,22 +1797,40 @@ def cmd_flag(args) -> int:
     value = args.value.strip()
     if not value:
         raise FGError("flag value cannot be empty")
-    existing = _find_flag_fact(store, value)
+    challenge = (args.challenge or "").strip() or _infer_challenge_from_store(store)
+    question_id = (getattr(args, "question", None) or "").strip()
+    instance_id = (getattr(args, "instance", None) or "").strip()
+    answer = None
+    if getattr(args, "answer_json", False):
+        try:
+            answer = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise FGError(f"--answer-json value is not valid JSON: {exc}") from exc
+        if not isinstance(answer, (str, list)):
+            raise FGError("--answer-json must decode to a string or a list of strings")
+    existing = _find_flag_fact(store, value, challenge, question_id)
     if existing is not None:
         d = existing.get("data") or {}
         raise FGError(
             f"flag already recorded as {existing['id']} "
-            f"(status={d.get('status', 'recorded')}, challenge={d.get('challenge', '?')})"
+            f"(status={d.get('status', 'recorded')}, challenge={d.get('challenge', '?')}, "
+            f"question={d.get('question_id', '?')})"
         )
-    challenge = (args.challenge or "").strip()
     description = f"flag captured: {value}" + (f" (challenge {challenge})" if challenge else "")
+    fact_data = {"value": value, "challenge": challenge, "status": "recorded"}
+    if question_id:
+        fact_data["question_id"] = question_id
+    if instance_id:
+        fact_data["instance_id"] = instance_id
+    if getattr(args, "answer_json", False):
+        fact_data["answer_json"] = "true"
     fact = store.add_fact(
         description=description,
         creator=args.creator,
         source_intent=None,
         title=args.title or "flag",
         kind="flag",
-        data={"value": value, "challenge": challenge, "status": "recorded"},
+        data=fact_data,
     )
     print(f"{fact['id']} recorded")
     if not args.submit:
@@ -1783,19 +1838,43 @@ def cmd_flag(args) -> int:
         return 0
     client = _arena_client(store)
     if not challenge:
-        print("sapper: warning: no --challenge given; submit endpoint may need it", file=sys.stderr)
+        print("sapper: warning: no --challenge and no challenge dir inferred; "
+              "submit endpoint may need it", file=sys.stderr)
     try:
-        reply = client.submit_flag(challenge or "-", value)
-    except FGError:
-        raise
-    except Exception as exc:  # ArenaError subclasses Exception
-        store.update_flag_fact(fact["id"], "rejected", str(exc))
-        raise FGError(f"submit failed, flag kept as {fact['id']} (recorded): {exc}") from exc
-    raw = json.dumps(reply.get("result", {}), ensure_ascii=False)
-    accepted = reply.get("status") == 200
+        reply = client.submit_flag(
+            challenge or "-", value,
+            instance_id=instance_id or None,
+            question_id=question_id or None,
+            answer=answer,
+        )
+    except FGError as exc:
+        code = str(getattr(exc, "code", "") or "")
+        defer = code in _DEFERRABLE_SUBMIT_CODES
+        if hasattr(exc, "status") and not defer:
+            store.update_flag_fact(fact["id"], "rejected", str(exc)[:500])
+        else:
+            store.update_flag_fact(fact["id"], "recorded", str(exc)[:500])
+        raise FGError(
+            f"submit failed, flag kept as {fact['id']} "
+            f"({'recorded' if (defer or not hasattr(exc, 'status')) else 'rejected'}): {exc}"
+        ) from exc
+    raw = json.dumps(reply.get("result", reply), ensure_ascii=False)
+    accepted = bool(reply.get("accepted", reply.get("status") == 200))
     status = "submitted" if accepted else "rejected"
-    store.update_flag_fact(fact["id"], status, raw[:500])
-    print(f"{fact['id']} {status}: {raw[:300]}")
+    extra = {
+        "instance_id": reply.get("instance_id") or instance_id or None,
+        "question_id": reply.get("question_id") or question_id or None,
+        "solve_rank": reply.get("solve_rank"),
+        "attempts_remaining": reply.get("attempts_remaining"),
+    }
+    store.update_flag_fact(fact["id"], status, raw[:500], extra=extra)
+    detail = f"correct={reply.get('correct')}"
+    if reply.get("question_id"):
+        detail += f" question={reply['question_id']}"
+    if reply.get("attempts_remaining") is not None:
+        detail += f" attempts_remaining={reply['attempts_remaining']}"
+    print(f"{fact['id']} {status}: {detail}")
+    print(raw[:300])
     return 0 if accepted else 1
 
 
@@ -1804,33 +1883,104 @@ def cmd_flag(args) -> int:
 # --------------------------------------------------------------------------- #
 def cmd_arena(args) -> int:
     store = Store(Path(args.store))
-    if args.action == "init":
+    action = args.action
+    if action == "init":
         arena = _load_arena_module()
         path = arena.ArenaClient.config_path(store.root)
         if path.exists():
             raise FGError(f"arena config already exists: {path}")
-        written = arena.ArenaClient.write_template(store.root)
-        print(f"wrote {written} — fill in the official API base_url/endpoints, "
-              f"then export SAPPER_ARENA_TOKEN")
+        written = arena.ArenaClient.write_template(
+            store.root, platform=getattr(args, "platform", None))
+        print(f"wrote {written} — fill in base_url/token (or export the platform "
+              f"env vars: BENCHMARK_* for TSecBench, CTFY_* for TPCTF/CTFy)")
         return 0
     store.require()
     client = _arena_client(store)
-    action = args.action
+    code = getattr(args, "challenge_id", None)
+    instance_id = getattr(args, "instance", None) or None
+
     if action == "challenges":
         reply = client.list_challenges()
+    elif action == "competitions":
+        reply = client.list_competitions()
+    elif action == "info":
+        reply = client.describe()
+    elif action == "challenge":
+        if not code:
+            raise FGError("arena challenge requires a challenge id")
+        reply = client.get_challenge(code)
+    elif action == "instances":
+        reply = client.list_instances(challenge_id=code or "")
+    elif action == "instance":
+        if not code:
+            raise FGError("arena instance requires an instance id")
+        reply = client.get_instance(code)
     elif action == "start":
-        reply = client.start_challenge(args.challenge_id)
+        if not code:
+            raise FGError("arena start requires a challenge id")
+        reply = client.start_challenge(code, ttl=getattr(args, "ttl", None))
     elif action == "stop":
-        reply = client.close_challenge(args.challenge_id)
+        if not code:
+            raise FGError("arena stop requires a challenge id")
+        reply = client.close_challenge(code, instance_id=instance_id)
     elif action == "submit":
-        reply = client.submit_flag(args.challenge_id, args.flag)
+        if not code:
+            raise FGError("arena submit requires a challenge id")
+        if not args.flag:
+            raise FGError("arena submit requires --flag")
+        answer = None
+        if getattr(args, "answer_json", False):
+            try:
+                answer = json.loads(args.flag)
+            except json.JSONDecodeError as exc:
+                raise FGError(f"--answer-json is not valid JSON: {exc}") from exc
+        reply = client.submit_flag(
+            code, args.flag, instance_id=instance_id,
+            question_id=getattr(args, "question", None) or None,
+            answer=answer,
+        )
     elif action == "hint":
-        print("sapper: note — official rules deduct score for hints (-10%); "
-              "only ask when genuinely stuck", file=sys.stderr)
-        reply = client.get_hint(args.challenge_id)
+        if not code:
+            raise FGError("arena hint requires a challenge id")
+        hint_id = getattr(args, "hint", None) or None
+        if hint_id:
+            print("sapper: note — opening a hint tier can deduct score; "
+                  "only do this when genuinely stuck", file=sys.stderr)
+        reply = client.get_hint(code, hint_id=hint_id)
+    elif action == "vpn":
+        if not code:
+            raise FGError("arena vpn requires a challenge id")
+        if getattr(args, "up", False) and getattr(args, "down", False):
+            raise FGError("--up and --down are mutually exclusive")
+        if getattr(args, "down", False):
+            reply = client.vpn_down(
+                getattr(args, "out", None), instance_id=instance_id, code=code,
+            )
+        else:
+            reply = client.download_vpn_config(
+                code, out=getattr(args, "out", None), instance_id=instance_id,
+                up=bool(getattr(args, "up", False)),
+            )
+    elif action == "attachments":
+        if not code:
+            raise FGError("arena attachments requires a challenge id")
+        reply = client.download_attachments(
+            code, dest=getattr(args, "dir", None), instance_id=instance_id,
+            names=getattr(args, "name", None) or None,
+        )
+    elif action == "brief":
+        if not code:
+            raise FGError("arena brief requires a challenge id")
+        out = getattr(args, "out", None)
+        if out:
+            path = client.write_brief(code, out)
+            reply = {"status": 200, "unique_code": code, "brief": str(path)}
+        else:
+            print(client.build_brief(code), end="")
+            return 0
     else:
         raise FGError(f"unknown arena action {action!r}")
-    print(json.dumps(reply.get("result", {}), ensure_ascii=False, indent=2))
+    print(json.dumps(reply, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1939,12 +2089,15 @@ def _bench_prepare_graph(store: Store, challenge: dict, started: dict,
                          container_addrs: list[str]) -> None:
     """Create the per-challenge graph with the task facts seeded.
 
-    The challenge description and container output are UNTRUSTED DATA; they are
-    recorded as facts (which the prompts fence as untrusted), never obeyed.
+    The challenge description, question prompts and container output are
+    UNTRUSTED DATA; they are recorded as facts (which the prompts fence as
+    untrusted), never obeyed.
     """
+    code = str(challenge.get("unique_code"))
+    is_ctfy = bool(started.get("instance_id"))
+    origin = "CTFy" if is_ctfy else "TSecBench"
     if not store.exists():
-        store.init("TSecBench", f"solve challenge {challenge.get('unique_code')} and capture all flags")
-    existing = {f["id"] for f in store.list_facts()}
+        store.init(origin, f"solve challenge {code} and capture all flags")
 
     def add(kind, title, description, data):
         if not any(f.get("kind") == kind and (f.get("data") or {}) == data
@@ -1952,20 +2105,93 @@ def _bench_prepare_graph(store: Store, challenge: dict, started: dict,
             store.add_fact(description=description, creator="arena", title=title,
                            kind=kind, data=data)
 
-    add("note", "题目描述", f"challenge {challenge.get('unique_code')}: "
+    add("note", "题目描述", f"challenge {code}: "
         f"{challenge.get('description') or '(no description)'}",
-        {"challenge": str(challenge.get("unique_code")), "difficulty": str(challenge.get("difficulty"))})
+        {"challenge": code, "difficulty": str(challenge.get("difficulty")),
+         "category": str(challenge.get("category") or "")})
     for addr in container_addrs:
-        add("host", "靶标", f"target container address {addr}",
-            {"addr": addr, "challenge": str(challenge.get("unique_code"))})
-    # record how many flags are needed
+        add("host", "靶标", f"target entry point {addr}",
+            {"addr": addr, "challenge": code})
+
+    if is_ctfy:
+        iid = str(started.get("instance_id"))
+        vpn = started.get("vpn_backend") or ""
+        add("note", "实例", f"CTFy instance {iid} ({started.get('status')})",
+            {"challenge": code, "instance_id": iid,
+             "instance_status": str(started.get("status") or ""),
+             "expires_at": str(started.get("expires_at") or ""),
+             "vpn_backend": str(vpn),
+             "entry_urls": " ".join(started.get("entry_urls") or [])})
+        questions = [q for q in (started.get("questions") or [])
+                     if isinstance(q, dict) and q.get("id")]
+        for q in questions:
+            qid = str(q.get("id"))
+            choices = q.get("choices") or []
+            requires = q.get("requires") or []
+            add("note", f"小问 {qid}",
+                f"question {qid}: {(q.get('prompt') or '(no prompt)')[:500]}",
+                {"challenge": code, "instance_id": iid, "question_id": qid,
+                 "mode": str(q.get("mode") or ""),
+                 "prompt": str(q.get("prompt") or "")[:2000],
+                 "choices": json.dumps(choices, ensure_ascii=False) if choices else "",
+                 "requires": " ".join(str(r) for r in requires),
+                 "unlocked": "true" if q.get("unlocked", True) else "false",
+                 "answered_correctly": "true" if q.get("answered_correctly") else "false",
+                 "attempts_remaining": str(q.get("attempts_remaining"))})
+        solved = challenge.get("correct_flag_count", 0)
+        total = challenge.get("flag_count", len(questions) or 1)
+        cmds = "; ".join(
+            f"`sapper flag <value> -c {code} --question {q['id']} --submit`"
+            for q in questions
+        ) or f"`sapper flag <value> -c {code} --submit`"
+        store.add_hint(
+            content=(f"challenge {code} on CTFy: {solved}/{total} question(s) solved. "
+                     f"instance {iid}; entry points: {', '.join(container_addrs) or 'none'}. "
+                     f"VPN backend: {vpn or 'unknown'} (`sapper arena vpn {code} --up`). "
+                     f"Question ids: {', '.join(str(q['id']) for q in questions) or '(none)'}. "
+                     f"Submit exactly: {cmds}. "
+                     f"Full brief: `sapper arena brief {code}`; attachments: "
+                     f"`sapper arena attachments {code}`."),
+            creator="arena",
+        )
+        return
+
+    # TSecBench: one flag per challenge.
     store.add_hint(
-        content=(f"challenge {challenge.get('unique_code')}: {challenge.get('flag_count')} flag(s) "
+        content=(f"challenge {code}: {challenge.get('flag_count')} flag(s) "
                  f"required, {challenge.get('correct_flag_count', 0)} already correct. "
                  f"Targets: {', '.join(container_addrs) or 'none'}. "
                  f"Submit flags with `sapper flag <value> -c <code> --submit`."),
         creator="arena",
     )
+
+
+def _is_capacity_error(exc: Exception) -> bool:
+    """Both backends report the per-team active-instance cap differently."""
+    code = str(getattr(exc, "code", "") or "")
+    msg = str(exc).lower()
+    return code in ("team_capacity_exceeded", "invalid_state") or any(
+        marker in msg for marker in
+        ("max active", "capacity", "cap reached", "too many active",
+         "instance cap")
+    )
+
+
+def _bench_write_brief(client, store: Store, code: str) -> str:
+    """Write the CTFy agent brief into the graph; TSecBench has no brief."""
+    if getattr(client, "platform", "") != "ctfy":
+        return ""
+    writer = getattr(client, "write_brief", None)
+    if writer is None:
+        return ""
+    try:
+        return str(writer(code, store.root / "brief.md"))
+    except FGError as exc:
+        print(f"[bench] {code}: brief not written ({exc})")
+        return ""
+    except Exception as exc:  # a brief must never kill the solve loop
+        print(f"[bench] {code}: brief not written ({exc})")
+        return ""
 
 
 def _bench_submit_recorded(store: Store, code: str) -> int:
@@ -1982,18 +2208,43 @@ def _bench_submit_recorded(store: Store, code: str) -> int:
         value = data.get("value")
         if not value:
             continue
+        answer = None
+        if data.get("answer_json") == "true":
+            try:
+                answer = json.loads(value)
+            except json.JSONDecodeError:
+                answer = None
         try:
-            reply = client.submit_flag(code, value)
+            reply = client.submit_flag(
+                code, value,
+                instance_id=data.get("instance_id") or None,
+                question_id=data.get("question_id") or None,
+                answer=answer,
+            )
         except FGError as exc:
-            store.update_flag_fact(f["id"], "rejected", str(exc))
-            print(f"[bench]   submit failed for {f['id']}: {exc}")
+            code_name = str(getattr(exc, "code", "") or "")
+            if code_name in _DEFERRABLE_SUBMIT_CODES:
+                store.update_flag_fact(f["id"], "recorded", str(exc)[:500])
+                print(f"[bench]   {f['id']} deferred ({code_name}): {exc}")
+            else:
+                store.update_flag_fact(f["id"], "rejected", str(exc)[:500])
+                print(f"[bench]   submit failed for {f['id']}: {exc}")
             continue
         correct = bool(reply.get("correct"))
         award = reply.get("awarded", 0)
         progress = f"{reply.get('correct_flag_count')}/{reply.get('total_flag_count')}"
+        extra = {
+            "instance_id": reply.get("instance_id") or data.get("instance_id"),
+            "question_id": reply.get("question_id") or data.get("question_id"),
+            "solve_rank": reply.get("solve_rank"),
+            "attempts_remaining": reply.get("attempts_remaining"),
+        }
         store.update_flag_fact(f["id"], "submitted" if correct else "rejected",
-                               json.dumps(reply, ensure_ascii=False)[:400])
-        print(f"[bench]   {f['id']} {'CORRECT' if correct else 'wrong'} +{award} ({progress})")
+                               json.dumps(reply, ensure_ascii=False)[:400],
+                               extra=extra)
+        qid = reply.get("question_id") or data.get("question_id") or "-"
+        print(f"[bench]   {f['id']} {'CORRECT' if correct else 'wrong'} "
+              f"q={qid} +{award} ({progress})")
         submitted += 1
     return submitted
 
@@ -2043,7 +2294,7 @@ def cmd_bench(args) -> int:
             try:
                 started = client.start_challenge(code)
             except FGError as exc:
-                if "max active" in str(exc).lower():
+                if _is_capacity_error(exc):
                     print("[bench] active-container cap reached; closing the oldest and retrying next round")
                     break
                 print(f"[bench] {code}: cannot start ({exc})")
@@ -2052,6 +2303,7 @@ def cmd_bench(args) -> int:
             print(f"\n[bench] {code} started -> {addrs or '(no addr)'}")
             try:
                 _bench_prepare_graph(store, ch, started, addrs)
+                _bench_write_brief(client, store, code)
             except Exception as exc:  # graph problems must not kill the run
                 print(f"[bench] {code}: graph prep failed ({exc}); skipping this round")
                 try:
@@ -2148,7 +2400,7 @@ def _bench_parallel(args, client, root, cli, engine_args, todo, deadline) -> int
             try:
                 started = client.start_challenge(code)
             except FGError as exc:
-                if "max active" in str(exc).lower():
+                if _is_capacity_error(exc):
                     pending.insert(0, ch)  # try again after a slot frees
                     print("[bench] platform active-container cap reached; waiting for a slot")
                     break
@@ -2160,6 +2412,7 @@ def _bench_parallel(args, client, root, cli, engine_args, todo, deadline) -> int
             store = _bench_store(root, code)
             try:
                 _bench_prepare_graph(store, ch, started, addrs)
+                _bench_write_brief(client, store, code)
             except Exception as exc:
                 print(f"[bench] {code}: graph prep failed ({exc}); skipping")
                 try:
@@ -4556,8 +4809,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "flag", help="record a captured flag (dedupe; optionally submit via arena)"
     )
-    sp.add_argument("value", help="the flag string, e.g. flag{...}")
-    sp.add_argument("--challenge", "-c", default=None, help="challenge id on the platform")
+    sp.add_argument("value", help="the flag/answer string, e.g. flag{...}")
+    sp.add_argument("--challenge", "-c", default=None,
+                    help="challenge id (inferred from <code>/.sapper when omitted)")
+    sp.add_argument("--instance", default=None,
+                    help="CTFy instance id (auto-detected from the live instance)")
+    sp.add_argument("--question", "-q", default=None,
+                    help="CTFy question id; required when several questions are open")
+    sp.add_argument("--answer-json", action="store_true",
+                    help="treat VALUE as JSON (string or array) for CTFy array answers")
     sp.add_argument("--submit", action="store_true",
                     help="also submit via the arena API (requires .sapper/arena.json)")
     sp.add_argument("--title", "-t", default=None)
@@ -4565,14 +4825,34 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_flag)
 
     sp = sub.add_parser(
-        "arena", help="competition platform bridge (TSecBench-style API)"
+        "arena", help="competition platform bridge (TSecBench or TPCTF/CTFy)"
     )
     sp.add_argument(
-        "action", choices=["init", "challenges", "start", "stop", "submit", "hint"],
+        "action",
+        choices=["init", "info", "competitions", "challenges", "challenge",
+                 "instances", "instance", "start", "stop", "submit", "hint",
+                 "vpn", "attachments", "brief"],
         help="init: write .sapper/arena.json template; others call the platform API",
     )
-    sp.add_argument("challenge_id", nargs="?", default=None, help="challenge id")
-    sp.add_argument("--flag", default=None, help="flag value (for submit)")
+    sp.add_argument("challenge_id", nargs="?", default=None,
+                    help="challenge id (or instance id for `instance`)")
+    sp.add_argument("--flag", default=None, help="answer value (for submit)")
+    sp.add_argument("--instance", default=None, help="CTFy instance id")
+    sp.add_argument("--question", "-q", default=None, help="CTFy question id")
+    sp.add_argument("--hint", default=None, help="CTFy hint tier id to open (costs score)")
+    sp.add_argument("--answer-json", action="store_true",
+                    help="treat --flag as JSON (string or array)")
+    sp.add_argument("--ttl", type=int, default=None, help="instance TTL seconds")
+    sp.add_argument("--out", default=None, help="output path for vpn/brief")
+    sp.add_argument("--dir", default=None, help="attachment output directory")
+    sp.add_argument("--name", action="append",
+                    help="download only this attachment (repeatable)")
+    sp.add_argument("--up", action="store_true",
+                    help="bring the VPN tunnel up after downloading (needs NET_ADMIN)")
+    sp.add_argument("--down", action="store_true",
+                    help="tear down the VPN tunnel and restore /etc/hosts")
+    sp.add_argument("--platform", default=None, choices=["ctfy", "tsecbench"],
+                    help="platform for `arena init` (default: env detection)")
     sp.set_defaults(func=cmd_arena)
 
     sp = sub.add_parser(
@@ -4603,7 +4883,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "bench",
-        help="drive TSecBench end-to-end: list->start->solve->submit->close per challenge",
+        help="drive the arena end-to-end: list->start->solve->submit->close per challenge "
+             "(TSecBench or CTFy, selected by env)",
     )
     sp.add_argument("--root", default="runs", help="per-challenge graph root")
     sp.add_argument("--minutes", type=int, default=None, help="global budget (minutes)")

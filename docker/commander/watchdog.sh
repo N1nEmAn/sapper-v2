@@ -27,6 +27,8 @@
 set -o pipefail
 
 ROOT="${SAPPER_ROOT:-/work/runs}"
+export SAPPER_ROOT="$ROOT"          # ArenaClient.load(None) must find the same state file
+export SAPPER_ARENA_LIB="${SAPPER_ARENA_LIB:-/opt/sapper/lib/arena.py}"
 LOG="$ROOT/drive.log"
 # Model tiers (SKILL 4.9): the commander runs SMART; each worker keeps the tier
 # it was spawned with (persisted by worker.sh in ROOT/pane-env/<pane>.env).
@@ -50,11 +52,12 @@ NOW() { date +%s; }
 
 declare -A mode restarts enter_tries mission_restarts last_activity placeholder_since cooldown_log
 
-# ---- arena helper (verbatim from tmux-drive.sh) ------------------------------
+# ---- arena helper (TSecBench or CTFy, chosen by ArenaClient.load) ------------
 arena() {
   python3 - "$@" <<'PYEOF2'
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("arena", "/opt/sapper/lib/arena.py")
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location(
+    "arena", os.environ.get("SAPPER_ARENA_LIB", "/opt/sapper/lib/arena.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 c = m.ArenaClient.load(None)
 op = sys.argv[1]
@@ -63,7 +66,22 @@ if op == "list":
 elif op == "start":
     print(json.dumps(c.start_challenge(sys.argv[2])))
 elif op == "close":
-    print(json.dumps(c.close_challenge(sys.argv[2])))
+    iid = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
+    print(json.dumps(c.close_challenge(sys.argv[2], instance_id=iid)))
+elif op == "instance":
+    print(json.dumps(c.get_instance(sys.argv[2])))
+elif op == "active":
+    # exact live instances (CTFy); tsecbench has none to enumerate here
+    if getattr(c, "platform", "") != "ctfy":
+        print("[]")
+    else:
+        items = c.list_instances(limit=1000)
+        live = [{"code": i.get("challenge_id"), "id": i.get("id"),
+                 "status": i.get("status")}
+                for i in items if i.get("status") in ("starting", "ready")]
+        print(json.dumps(live))
+elif op == "vpn-down":
+    print(json.dumps(c.vpn_down(code=sys.argv[2])))
 PYEOF2
 }
 
@@ -181,13 +199,15 @@ QUOTA_RE='insufficient|balance|quota|exceeded|billing|payment|401|[Uu]nauthorize
 # cause of the 17:36 storm: per-minute limits were misread as a dead key)
 RATELIMIT_RE='每分钟|分钟级|rate.?limit|too many requests|429|1302|1311|1305' 
 
-# submit every recorded-unsubmitted flag fact in a challenge's graph (verbatim)
+# submit every recorded-unsubmitted flag fact in a challenge's graph
+# (instance/question aware; mirrors worker.sh finish_flags)
 finish_flags() {  # finish_flags <code>
   python3 - "$1" <<'PYFIN'
 import glob, json, os, sys, importlib.util
 code = sys.argv[1]
 root = os.environ.get("SAPPER_ROOT", "/work/runs")
-spec = importlib.util.spec_from_file_location("arena", "/opt/sapper/lib/arena.py")
+spec = importlib.util.spec_from_file_location(
+    "arena", os.environ.get("SAPPER_ARENA_LIB", "/opt/sapper/lib/arena.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 try:
     client = m.ArenaClient.load(None)
@@ -203,18 +223,44 @@ for path in sorted(glob.glob(f"{root}/{code}/.sapper/facts/*.json")):
     data = fact.get("data") or {}
     if data.get("status") not in (None, "recorded") or not data.get("value"):
         continue
+    answer = None
+    if data.get("answer_json") == "true":
+        try:
+            answer = json.loads(data["value"])
+        except Exception:
+            answer = None
     try:
-        r = client.submit_flag(code, data["value"])
+        r = client.submit_flag(
+            code, data["value"],
+            instance_id=data.get("instance_id") or None,
+            question_id=data.get("question_id") or None,
+            answer=answer,
+        )
         fact["data"]["status"] = "submitted" if r.get("correct") else "rejected"
+        for key in ("instance_id", "question_id", "solve_rank", "attempts_remaining"):
+            if r.get(key) is not None:
+                fact["data"][key] = str(r[key])
         json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
-        print(f"[finish] {code}: submit {data['value'][:24]}… correct={r.get('correct')}")
+        qid = r.get("question_id") or data.get("question_id") or "-"
+        print(f"[finish] {code}: submit {str(data['value'])[:24]}… "
+              f"q={qid} correct={r.get('correct')}")
     except Exception as exc:
         msg = str(exc)
-        if "already" in msg.lower() or "409" in msg:
+        err_code = str(getattr(exc, "code", "") or "")
+        deferrable = err_code in {"question_ambiguous", "no_open_question",
+                                  "no_instance", "instance_not_ready",
+                                  "question_locked", "team_capacity_exceeded",
+                                  "start_timeout", "platform_busy",
+                                  "competition_paused", "competition_not_in_session"}
+        if "already" in msg.lower() or "duplicate" in msg.lower():
             # duplicate submit = the flag WAS accepted earlier: absorb it
             fact["data"]["status"] = "submitted"
             json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
-            print(f"[finish] {code}: already submitted — marked ({data['value'][:20]}…)")
+            print(f"[finish] {code}: already submitted — marked ({str(data['value'])[:20]}…)")
+        elif deferrable:
+            fact["data"]["result"] = msg[:500]
+            json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
+            print(f"[finish] {code}: deferred ({err_code}) — kept recorded")
         else:
             print(f"[finish] {code}: submit failed ({exc})")
 PYFIN
@@ -267,8 +313,11 @@ sync_session_env() {  # tmux panes inherit the SESSION environment, NOT this
                       # relaunched pane boots claude on the stale dead key and
                       # re-triggers the quota error forever.
   local k v
-  for k in PATH ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN SAPPER_MODEL \
-           SAPPER_MODEL_FLASH BENCHMARK_BASE_URL BENCHMARK_TOKEN; do
+  for k in PATH ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY SAPPER_MODEL \
+           SAPPER_MODEL_FLASH SAPPER_PLATFORM SAPPER_ROOT SAPPER_ARENA_STATE \
+           SAPPER_ARENA_LIB BENCHMARK_BASE_URL BENCHMARK_TOKEN \
+           CTFY_BASE_URL CTFY_TOKEN CTFY_COMPETITION_ID CTFY_VERIFY_TLS \
+           DEEPSEEK_API_KEY DEEPSEEK_BASE_URL; do
     v=${!k:-}
     [[ -n "$v" ]] && tmux set-environment -t "$SESSION" "$k" "$v" >/dev/null 2>&1 || true
   done
@@ -441,14 +490,48 @@ finish_all() {  # SPEC unit 2 #6 — global deadline failsafe
     log "$code: deadline finish_flags"
     finish_flags "$code" 2>&1 | tee -a "$LOG"
   done
-  # close every open platform instance (409/other errors must never crash us)
+  # Drop every tunnel this container brought up and remove its /etc/hosts
+  # block. Best-effort — the deadline close below must still run.
+  for code in "${!seen[@]}"; do
+    arena vpn-down "$code" >/dev/null 2>&1 && log "$code: VPN tunnel down"
+  done
+  # close every open platform instance (409/other errors must never crash us).
+  # CTFy: exact live instances first (a challenge may be absent from the
+  # challenge listing, e.g. closed after full solve); then the legacy
+  # per-challenge sweep, which also covers TSecBench.
+  local -A closed=()
+  while IFS=$'\t' read -r code iid; do
+    [[ -n "$code" ]] || continue
+    arena vpn-down "$code" >/dev/null 2>&1 || true
+    if [[ -n "$iid" ]]; then
+      arena close "$code" "$iid" >/dev/null 2>&1 && closed[$code]=1
+    else
+      arena close "$code" >/dev/null 2>&1 && closed[$code]=1
+    fi
+    if [[ -n "${closed[$code]:-}" ]]; then
+      log "$code: instance closed"; n_closed=$((n_closed+1))
+    else
+      log "$code: instance close failed (ignored)"
+    fi
+  done < <(arena active 2>>"$LOG" | python3 -c '
+import json,sys
+try: items=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for i in items:
+    code = i.get("code") or ""
+    iid = i.get("id") or ""
+    if code: print(code + "\t" + iid)' 2>/dev/null || true)
   for code in $(arena list 2>>"$LOG" | python3 -c '
 import json,sys
 try: items=json.load(sys.stdin)
 except Exception: sys.exit(0)
 for c in items:
-    if isinstance(c,dict) and not c.get("is_completed"): print(c["unique_code"])' 2>/dev/null); do
+    if isinstance(c,dict) and not c.get("is_completed"):
+        print(c.get("unique_code") or "")' 2>/dev/null); do
+    [[ -n "$code" && -z "${closed[$code]:-}" ]] || continue
+    arena vpn-down "$code" >/dev/null 2>&1 || true
     if arena close "$code" >/dev/null 2>&1; then
+      closed[$code]=1
       log "$code: instance closed"; n_closed=$((n_closed+1))
     else
       log "$code: instance close failed (ignored)"
@@ -466,7 +549,7 @@ except Exception: print(0)' 2>/dev/null || echo 0)
 log "watchdog start: root=$ROOT session=$SESSION cmd_home=$CMD_HOME"
 printf '%s\n' "$END_AT" > "$ROOT/.deadline"   # board reads this: budget_left heartbeat
 log "env: model=$MODEL total=${TOTAL_MIN}m max_workers=$MAX_WORKERS stall=${STALL_SECONDS}s(informational) keys=$keys"
-log "env: benchmark=${BENCHMARK_BASE_URL:-unset} gateway=${ANTHROPIC_BASE_URL:-unset} deadline=$(date -d "@$END_AT" '+%F %T' 2>/dev/null || echo "in ${TOTAL_MIN}m")"
+log "env: platform=${SAPPER_PLATFORM:-auto} ctfy=${CTFY_BASE_URL:-unset} benchmark=${BENCHMARK_BASE_URL:-unset} gateway=${ANTHROPIC_BASE_URL:-unset} deadline=$(date -d "@$END_AT" '+%F %T' 2>/dev/null || echo "in ${TOTAL_MIN}m")"
 
 # family-initial credentials: what relaunch_pane falls back to before any rotation
 GLM_BASE_URL_INITIAL="${ANTHROPIC_BASE_URL:-}"

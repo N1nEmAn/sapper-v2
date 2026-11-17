@@ -12,5 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tmux \
 
 COPY docker/tmux-drive.sh      /opt/sapper/docker/tmux-drive.sh
 COPY docker/entrypoint-tmux.sh /usr/local/bin/sapper-entrypoint
-RUN chmod +x /usr/local/bin/sapper-entrypoint /opt/sapper/docker/tmux-drive.sh
+# Host may be Windows (CRLF); normalize before setting the executable bit.
+RUN sed -i 's/\r$//' /usr/local/bin/sapper-entrypoint /opt/sapper/docker/tmux-drive.sh \
+    && chmod +x /usr/local/bin/sapper-entrypoint /opt/sapper/docker/tmux-drive.sh
 USER agent

@@ -1,6 +1,10 @@
 .git
 dist
 tests
+.env
+.env.*
+docker/.env
+docker/.env.*
 *.pyc
 __pycache__
 .sapper

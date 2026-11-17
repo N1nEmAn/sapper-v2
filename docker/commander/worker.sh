@@ -26,6 +26,7 @@
 set -o pipefail
 
 ROOT="${SAPPER_ROOT:-/work/runs}"
+export SAPPER_ROOT="$ROOT"   # ArenaClient.load(None) must find the same state file
 LOG="$ROOT/drive.log"
 # Model tiers & gateways (SKILL 4.9, final doctrine): ALL-IN FLAGSHIP.
 #   glm gw + SMART (glm-5.3[1m]) is the default brain for EVERY worker — soldier,
@@ -73,6 +74,20 @@ elif op == "start":
     print(json.dumps(c.start_challenge(sys.argv[2])))
 elif op == "close":
     print(json.dumps(c.close_challenge(sys.argv[2])))
+elif op == "instance":
+    print(json.dumps(c.get_instance(sys.argv[2])))
+elif op == "info":
+    print(json.dumps(c.describe()))
+elif op == "brief":
+    print(json.dumps({"path": str(c.write_brief(sys.argv[2], sys.argv[3]))}))
+elif op == "attachments":
+    print(json.dumps(c.download_attachments(sys.argv[2], dest=sys.argv[3])))
+elif op == "vpn":
+    up = len(sys.argv) > 4 and sys.argv[4] == "1"
+    print(json.dumps(c.download_vpn_config(sys.argv[2], out=sys.argv[3],
+                                           up=up)))
+elif op == "vpn-down":
+    print(json.dumps(c.vpn_down(code=sys.argv[2])))
 PYEOF2
 }
 
@@ -100,18 +115,44 @@ for path in sorted(glob.glob(f"{root}/{code}/.sapper/facts/*.json")):
     data = fact.get("data") or {}
     if data.get("status") not in (None, "recorded") or not data.get("value"):
         continue
+    answer = None
+    if data.get("answer_json") == "true":
+        try:
+            answer = json.loads(data["value"])
+        except Exception:
+            answer = None
     try:
-        r = client.submit_flag(code, data["value"])
+        r = client.submit_flag(
+            code, data["value"],
+            instance_id=data.get("instance_id") or None,
+            question_id=data.get("question_id") or None,
+            answer=answer,
+        )
         fact["data"]["status"] = "submitted" if r.get("correct") else "rejected"
+        for key in ("instance_id", "question_id", "solve_rank", "attempts_remaining"):
+            if r.get(key) is not None:
+                fact["data"][key] = str(r[key])
         json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
-        print(f"[finish] {code}: submit {data['value'][:24]}… correct={r.get('correct')}")
+        qid = r.get("question_id") or data.get("question_id") or "-"
+        print(f"[finish] {code}: submit {str(data['value'])[:24]}… "
+              f"q={qid} correct={r.get('correct')}")
     except Exception as exc:
         msg = str(exc)
-        if "already" in msg.lower() or "409" in msg:
+        err_code = str(getattr(exc, "code", "") or "")
+        deferrable = err_code in {"question_ambiguous", "no_open_question",
+                                  "no_instance", "instance_not_ready",
+                                  "question_locked", "team_capacity_exceeded",
+                                  "start_timeout", "platform_busy",
+                                  "competition_paused", "competition_not_in_session"}
+        if "already" in msg.lower() or "duplicate" in msg.lower():
             # duplicate submit = the flag WAS accepted earlier: absorb it
             fact["data"]["status"] = "submitted"
             json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
-            print(f"[finish] {code}: already submitted — marked ({data['value'][:20]}…)")
+            print(f"[finish] {code}: already submitted — marked ({str(data['value'])[:20]}…)")
+        elif deferrable:
+            fact["data"]["result"] = msg[:500]
+            json.dump(fact, open(path, "w"), ensure_ascii=False, indent=2)
+            print(f"[finish] {code}: deferred ({err_code}) — kept recorded")
         else:
             print(f"[finish] {code}: submit failed ({exc})")
 PYFIN
@@ -159,8 +200,12 @@ sync_session_env() {  # tmux new-window inherits the SESSION environment, not th
                       # rotated by the watchdog reaches freshly spawned panes;
                       # PATH so the panes see the same tooling as the commander.
   local k v
-  for k in PATH ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN SAPPER_MODEL \
-           SAPPER_MODEL_FLASH BENCHMARK_BASE_URL BENCHMARK_TOKEN; do
+  for k in PATH ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY \
+           SAPPER_MODEL SAPPER_MODEL_FLASH SAPPER_PLATFORM SAPPER_ROOT \
+           SAPPER_ARENA_STATE SAPPER_ARENA_LIB \
+           BENCHMARK_BASE_URL BENCHMARK_TOKEN \
+           CTFY_BASE_URL CTFY_TOKEN CTFY_COMPETITION_ID CTFY_VERIFY_TLS \
+           DEEPSEEK_API_KEY DEEPSEEK_BASE_URL; do
     v=${!k:-}
     [[ -n "$v" ]] && tmux set-environment -t "$SESSION" "$k" "$v" >/dev/null 2>&1 || true
   done
@@ -231,6 +276,11 @@ close_instance() {  # close_instance <code> — finish_challenge pattern: flags 
   local code=$1
   log "$code: submitting recorded flags before close"
   finish_flags "$code" 2>&1 | tee -a "$LOG" >&2 || true
+  # Tear the per-instance tunnel down before its target disappears, and restore
+  # the /etc/hosts block. Best-effort: a missing tunnel must not block close.
+  if arena vpn-down "$code" >/dev/null 2>&1; then
+    log "$code: VPN tunnel down (hosts restored)"
+  fi
   if arena close "$code" >/dev/null 2>&1; then
     log "$code: platform instance closed"
   else
@@ -241,14 +291,14 @@ close_instance() {  # close_instance <code> — finish_challenge pattern: flags 
 
 general_mission() {  # general_mission <code> <addrs> — smart worker allowed to hire -p squads
   local code=$1 addrs=$2
-  printf '%s' "You are a GENERAL (senior operator) on challenge $code. Think DEEPLY — you have the biggest brain on this challenge, use it: plan the full attack chain before executing, reason step by step. Targets: ${addrs}. You solve the challenge yourself AND you may hire one-shot squads for bounded chores: run /opt/sapper/docker/commander/worker.sh spawn $code --p --minutes 5 --mission \"<chore: recon sweep / verify a guess / fuzz one endpoint>\" — the squad runs ~5 min, prints results in its pane, then goes idle: peek its pane (worker.sh peek <pane> 120), harvest, and kill it (worker.sh kill <pane>). Squads share this challenge's fact graph — tell them to read it first. Caps: panes are limited (a spawn failing with exit 4 means wait or fire a squad); keep at most 2 squads at a time; never let a squad idle long after it finishes. Record findings as facts, capture EVERY flag and IMMEDIATELY run sapper flag \"flag{...}\" -c $code --submit. Communication with your commander: [HELP]/[REPORT] notes in the graph as usual. Work fully autonomously; reply DONE only when the challenge is finished. Flag submission: primary is sapper flag VALUE -c $code --submit; if that command errors, submit by direct POST to the platform endpoint $BENCHMARK_BASE_URL/openapi/v1/challenges/submit with a JSON body containing unique_code and flag fields plus header BENCHMARK_TOKEN from env — write the one-liner yourself with urllib or curl; both routes count."
+  printf '%s' "You are a GENERAL (senior operator) on challenge $code. Think DEEPLY — you have the biggest brain on this challenge, use it: plan the full attack chain before executing, reason step by step. Read $ROOT/$code/.sapper/brief.md FIRST if it exists (instance id, entry points, VPN, question ids/prompts). Targets: ${addrs}. You solve the challenge yourself AND you may hire one-shot squads for bounded chores: run /opt/sapper/docker/commander/worker.sh spawn $code --p --minutes 5 --mission \"<chore: recon sweep / verify a guess / fuzz one endpoint>\" — the squad runs ~5 min, prints results in its pane, then goes idle: peek its pane (worker.sh peek <pane> 120), harvest, and kill it (worker.sh kill <pane>). Squads share this challenge's fact graph — tell them to read it first. Caps: panes are limited (a spawn failing with exit 4 means wait or fire a squad); keep at most 2 squads at a time; never let a squad idle long after it finishes. Record findings as facts, capture EVERY answer and submit it immediately. Submission (CTFy multi-question): sapper flag \"<answer>\" -c $code --question <qid> --submit ; array answers: sapper flag '<json>' -c $code --question <qid> --answer-json --submit ; TSecBench single flag: sapper flag \"flag{...}\" -c $code --submit. NEVER guess a CTFy answer — a wrong attempt consumes attempts_remaining. Communication with your commander: [HELP]/[REPORT] notes in the graph as usual. Work fully autonomously; reply DONE only when the challenge is finished. Scope: only the instance targets in the brief; never attack the CTFy platform, scoring, VPN server, or other teams."
 }
 
 default_mission() {  # default_mission <code> <addrs> <primary 0|1>
                      # operator prompt carried over from tmux-drive.sh launch()
   local code=$1 addrs=$2 primary=$3 extra=""
   (( ! primary )) && extra=" Another agent is also working $code from a sibling directory — you SHARE one fact graph: read the existing facts before repeating work, and record every new finding with sapper fact so your partner sees it."
-  printf '%s' "You are an autonomous pentest operator in a CTF benchmark. Think DEEPLY before acting: plan multi-step exploits carefully, reason about what each command's output tells you before the next one — depth of thought is your main weapon. Challenge: $code. Target container addresses (reach them directly): ${addrs}. Mission: recon the target, find the vulnerabilities, capture EVERY flag, and for each flag IMMEDIATELY run: sapper flag \"flag{...}\" -c $code --submit  (this submits to the scoring platform and prints the result). Record findings as typed facts: sapper fact \"...\" -k service -d host=... -d port=...  Consult the knowledge base when unsure: sapper kb search \"keywords\". Multiple flags are likely — after one submission keep hunting the rest. Communication: your commander reads this challenge's fact graph every ~2 minutes — to reach it, record a fact: sapper fact \"[HELP] <exactly what you tried, what blocks you, what decision you need>\" -k note (only when GENUINELY blocked, max one open HELP at a time; keep working alternatives while waiting) or \"[REPORT] <significant intel>\" -k note (interesting findings your commander may relay to other challenges). Do not wait idle for replies. When totally done, reply with the single word DONE.$extra"
+  printf '%s' "You are an autonomous pentest operator in a CTF competition. Think DEEPLY before acting: plan multi-step exploits carefully, reason about what each command's output tells you before the next one — depth of thought is your main weapon. Challenge: $code. READ $ROOT/$code/.sapper/brief.md FIRST if it exists — it carries the instance id, entry points, VPN instructions, question ids/prompts and exact submit commands. Target addresses: ${addrs}. Mission: recon the target, find the vulnerabilities, capture EVERY answer and submit it. CTFy submissions are per question: sapper flag \"<answer>\" -c $code --question <qid> --submit (array answers: sapper flag '<json>' -c $code --question <qid> --answer-json --submit). TSecBench submissions are: sapper flag \"flag{...}\" -c $code --submit. NEVER guess a CTFy answer — a wrong attempt consumes attempts_remaining. Record findings as typed facts: sapper fact \"...\" -k service -d host=... -d port=... Consult the knowledge base when unsure: sapper kb search \"keywords\". Multiple questions are likely — after one correct submission keep hunting the rest. Scope discipline: only the targets listed in the brief; never attack the CTFy platform, scoring infrastructure, VPN server, or other teams. Communication: your commander reads this challenge's fact graph every ~2 minutes — record a fact \"[HELP] <exactly what you tried, what blocks you, what decision you need>\" -k note (only when GENUINELY blocked, max one open HELP at a time) or \"[REPORT] <significant intel>\" -k note. Do not wait idle for replies. When totally done, reply with the single word DONE.$extra"
 }
 
 # ---- spawn -------------------------------------------------------------------
@@ -345,13 +395,15 @@ except Exception: pass' 2>/dev/null)
     if [[ -n "$got" ]]; then
       addrs=$got
       printf '%s\n' "$addrs" > "$ROOT/$code/.addrs"
-    elif grep -qi "max active" "$err" 2>/dev/null; then
+    elif grep -qiE "max active|team_capacity|capacity_exceeded|cap reached|instance cap" "$err" 2>/dev/null; then
       rm -f "$err"
-      die 3 "PLATFORM CAP: close a challenge first (worker.sh kill <code> --close) — cannot start $code"
-    elif [[ -z "$addrs" ]]; then
+      die 3 "PLATFORM CAP: close a challenge/instance first (worker.sh kill <code> --close) — cannot start $code"
+    elif [[ -z "$addrs" && "$started" != *'"instance_id"'* ]]; then
       local e; e=$(tail -n 3 "$err" 2>/dev/null | tr '\n' ' ')
       rm -f "$err"
       die 1 "spawn: arena start failed for $code: ${e:-no container_addr returned}"
+    elif [[ -z "$addrs" ]]; then
+      log "$code: CTFy instance is up but returned no direct address — see .sapper/brief.md"
     else
       log "$code: arena start refused but persisted addrs look valid — reusing instance"
     fi
@@ -369,6 +421,38 @@ except Exception: pass' 2>/dev/null)
   fi
   # 3) trust preset
   trust_preset "$dir"
+
+  # 3b) CTFy artifacts: brief + attachments + VPN config.  Best effort: a
+  #     failed download must never stop the pane from starting.
+  if printf '%s' "$started" | grep -q '"instance_id"'; then
+    mkdir -p "$ROOT/$code/attachments" "$ROOT/$code/vpn"
+    printf '%s\n' "$started" > "$ROOT/$code/.instance.json"
+    # Per-challenge filename => per-challenge WireGuard interface. The old
+    # fixed "vpn.conf" made every tunnel call itself "vpn" and clash when two
+    # instances were live at once (qualifier/prelim cap 1/3).
+    local vpn_stem="sapper-$(printf '%s' "$code" | sha1sum | cut -c1-8)"
+    local vpn_conf="$ROOT/$code/vpn/$vpn_stem.conf"
+    local vpn_auto="${SAPPER_VPN_AUTO:-1}"
+    # Auto-up mirrors CEA's fleet behaviour: every CTFy interactive challenge
+    # is WireGuard-only. A missing NET_ADMIN/sudoers is logged, not fatal;
+    # .vpn.json still contains the downloaded config path.
+    arena vpn "$code" "$vpn_conf" "$vpn_auto" \
+      >"$ROOT/$code/.vpn.json" 2>>"$LOG" || true
+    if grep -q '"skipped"' "$ROOT/$code/.vpn.json" 2>/dev/null; then
+      log "$code: VPN not required (direct entry points)"
+    elif [[ "$vpn_auto" == "1" ]]; then
+      log "$code: VPN config + auto-up attempted ($vpn_conf)"
+    else
+      log "$code: VPN config downloaded (auto-up disabled, $vpn_conf)"
+    fi
+    if arena brief "$code" "$ROOT/$code/.sapper/brief.md" >/dev/null 2>"$ROOT/$code/.brief.err"; then
+      log "$code: brief -> $ROOT/$code/.sapper/brief.md"
+    else
+      log "$code: brief download failed ($(tail -n 1 "$ROOT/$code/.brief.err" 2>/dev/null))"
+    fi
+    arena attachments "$code" "$ROOT/$code/attachments" \
+      >"$ROOT/$code/.attachments.json" 2>>"$LOG" || true
+  fi
 
   # 4/5) the window (NO --continue: fresh session per pane; watchdog owns recovery)
   sync_session_env
@@ -542,11 +626,12 @@ cmd_board() {
       *) die 1 "board: unknown option $a (try --json)" ;;
     esac
   done
-  local arena_tmp pane_tmp rc
-  arena_tmp=$(mktemp); pane_tmp=$(mktemp)
+  local arena_tmp pane_tmp cap_tmp rc
+  arena_tmp=$(mktemp); pane_tmp=$(mktemp); cap_tmp=$(mktemp)
   arena list > "$arena_tmp" 2>/dev/null || printf '[]\n' > "$arena_tmp"
+  arena info > "$cap_tmp" 2>/dev/null || printf '{}\n' > "$cap_tmp"
   collect_panes > "$pane_tmp" || true
-  python3 - "$arena_tmp" "$pane_tmp" "$ROOT" "$MAX_WORKERS" "$as_json" <<'PYBOARD'
+  python3 - "$arena_tmp" "$pane_tmp" "$ROOT" "$MAX_WORKERS" "$as_json" "$cap_tmp" <<'PYBOARD'
 import glob, json, os, re, sys, time
 
 arena_path, pane_path, root = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -558,6 +643,8 @@ def load_json(path, default):
             return json.load(fh)
     except Exception:
         return default
+
+capinfo = load_json(sys.argv[6], {}) if len(sys.argv) > 6 else {}
 
 # -- platform rows (arena list; unreachable platform degrades to empty) --------
 plat = {}
@@ -647,10 +734,23 @@ for c in codes:
         "panes": panes.get(c, []),
     })
 
+# -- platform instance capacity (CTFy; describe() reports it, maybe racy) ------
+inst = None
+try:
+    cap_n = int(capinfo.get("cap"))
+    act_n = int(capinfo.get("active") or 0)
+    avail = capinfo.get("available")
+    inst = {"active": act_n, "cap": cap_n,
+            "available": int(avail) if avail is not None else max(cap_n - act_n, 0)}
+except Exception:
+    inst = None
+inst_str = f"{inst['active']}/{inst['cap']}" if inst else "-"
+
 if as_json:
     print(json.dumps({"now": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                       "workers_alive": alive, "worker_cap": max_workers,
-                      "codes": rows}, ensure_ascii=False, separators=(",", ":")))
+                      "instances": inst, "codes": rows},
+                     ensure_ascii=False, separators=(",", ":")))
     raise SystemExit(0)
 
 # heartbeat to drive.log (=> docker logs): the commander boards every loop,
@@ -682,7 +782,7 @@ try:
 except Exception:
     pass
 print(f"[board] heartbeat: codes={len(rows)} done={done_n} "
-      f"alive={alive}/{max_workers} flags_recorded={flags_r} "
+      f"alive={alive}/{max_workers} instances={inst_str} flags_recorded={flags_r} "
       f"flags_submitted={flags_s} budget_left={left} generals={generals}", file=sys.stderr)
 
 def kinds_str(k):
@@ -706,7 +806,7 @@ def panes_str(lst):
 widths = [("CODE(⚑=HELP!)", 17), ("DONE", 4), ("FLG", 7), ("FACTS", 6), ("KINDS", 16),
           ("INT o/c", 8), ("FLG r/s", 7), ("LAST", 5)]
 print(f"== sapper board {time.strftime('%H:%M')}  workers alive={alive}/{max_workers}"
-      f"  codes={len(rows)} ==")
+      f"  instances={inst_str}  codes={len(rows)} ==")
 print(" ".join(t.ljust(w) for t, w in widths) + "PANES")
 budget = 100 - 3  # header + column line + trailing guard
 for i, r in enumerate(rows):
@@ -730,7 +830,7 @@ for i, r in enumerate(rows):
     print(" ".join(cells).rstrip())
 PYBOARD
   rc=$?
-  rm -f "$arena_tmp" "$pane_tmp"
+  rm -f "$arena_tmp" "$pane_tmp" "$cap_tmp"
   return "$rc"
 }
 

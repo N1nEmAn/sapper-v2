@@ -18,10 +18,16 @@ RUN env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
         binwalk steghide exiftool redis-tools default-mysql-client postgresql-client \
         gdb checksec libgmp-dev libmpfr-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir --break-system-packages pycryptodome sympy ROPgadget \
-    && (pip3 install --no-cache-dir --break-system-packages ropper \
+    && pip3 install --no-cache-dir --break-system-packages \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60 --retries 5 \
+        pycryptodome sympy ROPgadget \
+    && (pip3 install --no-cache-dir --break-system-packages \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60 --retries 5 \
+        ropper \
         || echo "WARN: ropper skipped (py3.12 build issue) - ROPgadget covers it") \
-    && (pip3 install --no-cache-dir --break-system-packages gmpy2 z3-solver \
+    && (pip3 install --no-cache-dir --break-system-packages \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 60 --retries 5 \
+        gmpy2 z3-solver \
         || echo "WARN: gmpy2/z3 unavailable - continuing")
 
 # Codex CLI harness for --engine codex workers (experimental tier, SKILL 4.9).
@@ -29,8 +35,27 @@ RUN env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
 # OpenAI chat wire) — upgrading codex breaks every --engine codex worker.
 # npm flags copied from the base image's claude-code install (Kali npm blocks
 # native postinstall scripts without --allow-scripts).
-RUN npm install -g @openai/codex@0.42.0 --allow-scripts --omit=dev 2>/dev/null || \
-    npm install -g @openai/codex@0.42.0 2>/dev/null || echo "WARN: codex install failed (claude-only mode)"
+RUN npm install -g --registry=https://mirrors.cloud.tencent.com/npm/ \
+        @openai/codex@0.42.0 --allow-scripts --omit=dev 2>/dev/null || \
+    npm install -g --registry=https://mirrors.cloud.tencent.com/npm/ \
+        @openai/codex@0.42.0 2>/dev/null || echo "WARN: codex install failed (claude-only mode)"
+# CTFy/TPCTF VPN client tooling. worker.sh downloads each instance's config and
+# (SAPPER_VPN_AUTO=1, the default) brings it up after stripping DNS= and maps
+# *.internal into /etc/hosts. The container must run with --cap-add=NET_ADMIN
+# (wireguard may also need the host kernel module or wireguard-go).
+# Fault-tolerant: a missing package must not fail the image build.
+RUN env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    apt-get update \
+    && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    apt-get install -y --no-install-recommends wireguard-tools openvpn iproute2 \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "WARN: VPN client tools unavailable - configs can still be downloaded"
+# CTFy/TPCTF WireGuard: wg-quick needs root, and mapping *.internal targets
+# needs one write to /etc/hosts. Grant ONLY those two commands; the container
+# still needs --cap-add=NET_ADMIN. Same minimal rule CEA ships.
+RUN echo 'agent ALL=(root) NOPASSWD: /usr/bin/wg-quick, /usr/bin/tee /etc/hosts, /usr/bin/tee -a /etc/hosts' \
+        > /etc/sudoers.d/sapper-vpn \
+    && chmod 440 /etc/sudoers.d/sapper-vpn
 COPY docker/commander/ /opt/sapper/docker/commander/
 # kb overlay: this image's kb/ is FRESHER than the base image's (field entries
 # added late) — copy it over so commanders see the latest knowledge
@@ -39,7 +64,9 @@ COPY kb/ /opt/sapper/kb/
 RUN mkdir -p /home/agent/.codex \
     && cp /opt/sapper/docker/commander/codex-home/config.toml /home/agent/.codex/config.toml \
     && chown -R agent:agent /home/agent/.codex
-RUN chmod +x /opt/sapper/docker/commander/worker.sh \
+RUN find /opt/sapper/docker/commander -type f \( -name '*.sh' -o -name '*.py' \) \
+        -exec sed -i 's/\r$//' {} + \
+    && chmod +x /opt/sapper/docker/commander/worker.sh \
              /opt/sapper/docker/commander/watchdog.sh \
              /opt/sapper/docker/commander/entrypoint.sh \
     && chown -R agent:agent /opt/sapper/docker/commander

@@ -22,6 +22,13 @@ challenge flag) is already satisfied, and decide the next executor intents.
 Think like a senior pentester running an engagement notebook: enumerate,
 correlate, reuse, escalate.
 
+On CTFy/TPCTF a challenge may hold several questions (`flag1`, `flag2`, ...),
+each scored and attempt-capped separately. The target brief at
+`.sapper/brief.md` lists their ids, prompts, unlock prerequisites and remaining
+attempts. Goal is satisfied only when every reachable question is solved (or
+the rest are documented as locked/exhausted). Never propose guessing an
+answer: a wrong submission burns the question's attempt budget.
+
 # Time budget
 ```
 {time_budget}
@@ -84,9 +91,9 @@ Reject only when execution would be clearly inappropriate:
   timebox in the doc (e.g. "if not exploitable in ~10 min, record and stop").
   When the next step is a known technique/CVE class, point the executor at
   the knowledge base: `sapper kb search "<keywords>"`.
-- Scope discipline: only the target IPs/hosts given by the platform. Never
-  propose attacking the platform API itself, scoring infrastructure, or
-  other teams' machines.
+- Scope discipline: only the target IPs/hosts given by the platform brief. Never
+  propose attacking the platform API itself, scoring infrastructure, VPN
+  endpoints/gateways, challenge authoring, or another team's instances/machines.
 - Do not invent results. If evidence is missing, propose an intent to get it.
 - **Reuse prior work.** Before proposing a NEW intent, check whether the
   Graph already contains a similar prior fact/intent (titles + descriptions

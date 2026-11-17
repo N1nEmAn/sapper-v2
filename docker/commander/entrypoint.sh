@@ -22,6 +22,8 @@ log() { printf '[sapper-cmd] %s\n' "$*"; }
 die() { printf '[sapper-cmd] FATAL: %s\n' "$*" >&2; exit 1; }
 
 ROOT="${SAPPER_ROOT:-/work/runs}"
+export SAPPER_ROOT="$ROOT"
+export SAPPER_ARENA_LIB="${SAPPER_ARENA_LIB:-/opt/sapper/lib/arena.py}"
 LOG="$ROOT/drive.log"
 MODEL="${SAPPER_MODEL:-glm-5.3[1m]}"   # commander brain: SMART tier
 TOTAL_MIN="${SAPPER_TOTAL_MINUTES:-470}"
@@ -30,11 +32,41 @@ CMD_HOME="$ROOT/commander-home"
 WATCHDOG=/opt/sapper/docker/commander/watchdog.sh
 
 # ---- 1. required env (platform + model gateway) ----------------------------
-[[ -n "${BENCHMARK_BASE_URL:-}" ]] || die "BENCHMARK_BASE_URL is not set"
-[[ -n "${BENCHMARK_TOKEN:-}" ]] || die "BENCHMARK_TOKEN is not set"
+# Two supported challenge platforms: TSecBench (BENCHMARK_*) and CTFy/TPCTF
+# (CTFY_*). SAPPER_PLATFORM forces a choice; otherwise BENCHMARK_* wins when
+# both are present (lib/arena.py makes the same choice).
+if [[ -z "${SAPPER_PLATFORM:-}" ]]; then
+  if [[ -n "${BENCHMARK_BASE_URL:-}" || -n "${BENCHMARK_TOKEN:-}" ]]; then
+    SAPPER_PLATFORM=tsecbench
+  elif [[ -n "${CTFY_TOKEN:-}" || -n "${CTFY_BASE_URL:-}" ]]; then
+    SAPPER_PLATFORM=ctfy
+  else
+    die "no platform configured: set BENCHMARK_BASE_URL+BENCHMARK_TOKEN (TSecBench) or CTFY_TOKEN (CTFy)"
+  fi
+fi
+case "$SAPPER_PLATFORM" in
+  ctfy|tpctf|tsinghua) SAPPER_PLATFORM=ctfy ;;
+  tsecbench|tsec|benchmark|tencent) SAPPER_PLATFORM=tsecbench ;;
+  *) die "SAPPER_PLATFORM=$SAPPER_PLATFORM is not one of: ctfy, tsecbench" ;;
+esac
+export SAPPER_PLATFORM
+
+if [[ "$SAPPER_PLATFORM" == tsecbench ]]; then
+  [[ -n "${BENCHMARK_BASE_URL:-}" ]] || die "BENCHMARK_BASE_URL is not set"
+  [[ -n "${BENCHMARK_TOKEN:-}" ]] || die "BENCHMARK_TOKEN is not set"
+else
+  CTFY_BASE_URL="${CTFY_BASE_URL:-https://ctfy.tsinghua.edu.cn/api/v1}"
+  CTFY_BASE_URL="${CTFY_BASE_URL%/}"
+  [[ "$CTFY_BASE_URL" == */api/v1 ]] || CTFY_BASE_URL="$CTFY_BASE_URL/api/v1"
+  [[ -n "${CTFY_TOKEN:-}" ]] || die "CTFY_TOKEN is not set (Bearer token from the CTFy UI)"
+  export CTFY_BASE_URL CTFY_TOKEN CTFY_COMPETITION_ID="${CTFY_COMPETITION_ID:-}"
+fi
+if [[ -z "${ANTHROPIC_AUTH_TOKEN:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  die "set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY (model gateway)"
+fi
 : "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL}"
-: "${ANTHROPIC_AUTH_TOKEN:?set ANTHROPIC_AUTH_TOKEN}"
-export ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}" \
+       ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 \
        DISABLE_ERROR_REPORTING=1 DISABLE_AUTOUPDATER=1 IS_SANDBOX=1
 
@@ -59,16 +91,35 @@ d.setdefault("projects", {})[sys.argv[1]] = {
 json.dump(d, open(path, "w"))
 PYTRUST
 
-# ---- 4. preflight: platform reachability + GLM smoke -----------------------
-log "platform = $BENCHMARK_BASE_URL"
+# ---- 4. preflight: platform reachability + model smoke ---------------------
+if [[ "$SAPPER_PLATFORM" == ctfy ]]; then
+  log "platform = CTFy ($CTFY_BASE_URL)"
+else
+  log "platform = TSecBench ($BENCHMARK_BASE_URL)"
+fi
 log "gateway  = $ANTHROPIC_BASE_URL"
 log "model    = $MODEL (commander architecture, watchdog budget ${TOTAL_MIN}min)"
-case "$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-        -H "BENCHMARK_TOKEN: $BENCHMARK_TOKEN" \
-        "$BENCHMARK_BASE_URL/openapi/v1/challenges" || true)" in
-  2*) log "platform reachable" ;;
-  *)  die "cannot reach $BENCHMARK_BASE_URL/openapi/v1/challenges (check BENCHMARK_TOKEN / gateway)" ;;
-esac
+curl_opts=(-s -o /dev/null -w '%{http_code}' --max-time 20)
+if [[ "$SAPPER_PLATFORM" == ctfy ]]; then
+  case "${CTFY_VERIFY_TLS:-1}" in 0|false|no|off|False|No|Off) curl_opts+=(-k) ;; esac
+  code=$(curl "${curl_opts[@]}" -H "Authorization: Bearer $CTFY_TOKEN" \
+             "$CTFY_BASE_URL/competitions" || true)
+  case "$code" in
+    2*) log "platform reachable (CTFy competitions ok)" ;;
+    401|403) die "CTFy rejected the token (HTTP $code) — check CTFY_TOKEN" ;;
+    *)  die "cannot reach $CTFY_BASE_URL/competitions (HTTP $code; check CTFY_BASE_URL / network)" ;;
+  esac
+  [[ -n "${CTFY_COMPETITION_ID:-}" ]] \
+    && log "competition pinned: $CTFY_COMPETITION_ID" \
+    || log "competition: auto-select the single running registered competition"
+else
+  code=$(curl "${curl_opts[@]}" -H "BENCHMARK_TOKEN: $BENCHMARK_TOKEN" \
+             "$BENCHMARK_BASE_URL/openapi/v1/challenges" || true)
+  case "$code" in
+    2*) log "platform reachable (TSecBench challenges ok)" ;;
+    *)  die "cannot reach $BENCHMARK_BASE_URL/openapi/v1/challenges (HTTP $code; check BENCHMARK_TOKEN / gateway)" ;;
+  esac
+fi
 
 log "model CLI smoke test…"
 if ! printf 'reply with the single word: ok' \
@@ -122,7 +173,7 @@ done
 printf '%s' "$pane" | grep -q '❯' || log "WARNING: commander input box never appeared (watchdog will retry)"
 
 # ---- 7. bootstrap prompt ---------------------------------------------------
-bootstrap="You are the autonomous field commander of a pentest campaign (TSecBench). Read /opt/sapper/docker/commander/SKILL.md and follow it exactly. First read $ROOT/commander-state.md if it exists — it is your handover from a previous incarnation; if it does not exist, start commanding from scratch. Then run the SKILL.md loop immediately (worker.sh board -> think -> act -> sleep 60-120 -> repeat) until the deadline. Work fully autonomously, never ask questions. Begin now."
+bootstrap="You are the autonomous field commander of a pentest campaign on a CTF challenge platform (${SAPPER_PLATFORM}). Read /opt/sapper/docker/commander/SKILL.md and follow it exactly. First read $ROOT/commander-state.md if it exists — it is your handover from a previous incarnation; if it does not exist, start commanding from scratch. Then run the SKILL.md loop immediately (worker.sh board -> think -> act -> sleep 60-120 -> repeat) until the deadline. Work fully autonomously, never ask questions. Begin now."
 if printf '%s' "$pane" | grep -q '❯'; then
   send_literal commander "$bootstrap"
   sleep 3

@@ -37,7 +37,7 @@ sapper 的价值不在任何单个 Agent，而在**组织多个 Agent 协同作�
 - **从 [nvwabase · 女娲基座](https://github.com/N1nEmAn/nvwabase) 起步**——三能力齐备的通用底座，不带渗透军规，直接迭代出你自己的分工
 - **或者在本项目上改**——但要改的**不止是军规**，环境配置同样必须动：
   - `docker/commander/SKILL.md`（426 行军规）→ 换成你场景的策略
-  - `BENCHMARK_BASE_URL` 等平台环境变量 → 竞赛引擎开机预检会**硬校验**平台 API（所以只配模型 key、不配平台地址就会报 `BENCHMARK_BASE_URL is not set`）；脱离竞赛平台自用，需要自己提供/占位这套平台接口
+  - `BENCHMARK_BASE_URL` / `CTFY_BASE_URL` 等平台环境变量 → 竞赛引擎开机预检会**硬校验**平台 API（所以只配模型 key、不配平台地址就会报 `BENCHMARK_BASE_URL is not set`）；脱离竞赛平台自用，需要自己提供/占位这套平台接口。`lib/arena.py` 已内置 TSecBench（`BENCHMARK_*`）与 TPCTF/CTFy（`CTFY_*`）两套后端
   - 模型网关与密钥环境变量（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `SAPPER_MODEL` / `SAPPER_KEY_POOL`…）→ 换成你自己的模型服务
   - watchdog 的预算/死线、报告模板 → 按你的场景调整
 - 反正有 AI 嘛，可以灵活变化——改军规的军规也是让 AI 帮你写
@@ -175,6 +175,33 @@ docker load < sapper-v18-mixed.tar.gz
 ```
 
 环境变量配置见 [docker/ENV.md](docker/ENV.md)（模型网关 / key 池 / 预算）。
+
+TPCTF 2026 / CTFy 快速启动（同一镜像也支持 TSecBench）：
+
+> CTFy 后端与 VPN 接线是在 v18 发布之后加入的：请用上面的「方式一」从源码构建。
+> v18-champion 预构建镜像不含这些改动。
+
+```bash
+docker run --rm -it --cap-add=NET_ADMIN \
+  -e SAPPER_PLATFORM=ctfy \
+  -e CTFY_BASE_URL=https://ctfy.tsinghua.edu.cn/api/v1 \
+  -e CTFY_TOKEN="$CTFY_TOKEN" \
+  -e CTFY_COMPETITION_ID="$CTFY_COMPETITION_ID" \
+  -e ANTHROPIC_BASE_URL="$GATEWAY_URL" -e ANTHROPIC_API_KEY="$GATEWAY_KEY" \
+  -e SAPPER_TOTAL_MINUTES=470 \
+  -v "$PWD/runs:/work/runs" sapper:latest
+```
+
+- 实例并发上限实时读取（board 心跳 `instances=active/cap`）：入围赛 1，初选/正式赛 3
+- flag 按子问提交：`sapper flag "<answer>" -c <challenge> --question <qid> --submit`
+  （数组答案加 `--answer-json`）。worker 先读 `.sapper/brief.md` 里的实例/凭据/附件/VPN/子问信息
+- 交互式题目均走 WireGuard。spawn 时 `worker.sh` 下载 per-instance 配置；除非设
+  `SAPPER_VPN_AUTO=0`，否则自动去 `DNS=` 行后拉起隧道（避免 wg-quick 改写
+  `/etc/resolv.conf` 断掉模型网关），并用配置里的 DNS 把 `*.internal` 写进
+  `/etc/hosts`。`network_topology=simple` 的直连实例跳过隧道。因此容器需要 `--cap-add=NET_ADMIN`；镜像的 sudoers 只放行
+  `wg-quick` 与 `tee /etc/hosts`。`sapper arena vpn <challenge> --down` 关隧道，
+  到点 watchdog 也会兜底
+- 严禁引导 Agent 攻击平台 API、计分、VPN 网关或其他队伍实例
 
 单图操作 / 事实意图 CLI / 多题 sweep 全量命令见 [SKILL.md](SKILL.md)。
 

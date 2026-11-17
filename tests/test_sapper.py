@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import importlib.util
 import json
@@ -592,6 +593,676 @@ class ArenaErrorBridgeTests(unittest.TestCase):
             self.assertIn("max active", str(ctx.exception).lower())
         finally:
             server.shutdown()
+
+
+class CTFyArenaClientTests(unittest.TestCase):
+    """CTFy / TPCTF contract: Bearer auth, /api/v1 URL normalization,
+    competition auto-select, instance start/poll/reuse, question-level
+    submission, capacity pre-check, attachments/VPN and error envelopes."""
+
+    def _arena(self):
+        spec = importlib.util.spec_from_file_location(
+            "_arena_ctfy_test", ROOT / "lib" / "arena.py")
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _serve(handler):
+        import threading
+        from http.server import HTTPServer
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_full_ctfy_flow_against_local_server(self):
+        import urllib.parse
+        from http.server import BaseHTTPRequestHandler
+        arena = self._arena()
+        seen_auth = []
+        state = {"instance": None, "start_posts": 0, "submit_bodies": []}
+
+        challenge = {
+            "id": "AUTH-1", "name": "auth one", "category": "web",
+            "difficulty": "easy", "description": "d",
+            "questions": [
+                {"id": "flag1", "prompt": "p1", "mode": "text", "requires": []},
+                {"id": "flag2", "prompt": "p2", "mode": "text",
+                 "requires": ["flag1"]},
+            ],
+            "my_team_solved_question_ids": [], "my_team_fully_solved": False,
+            "attachments": [{"name": "welcome.txt", "size": 5},
+                            {"name": "team.txt", "size": 4, "per_team": True}],
+            "closed": False, "scoring": "dynamic", "launch_ttl_s": 3600,
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, obj, code=200):
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _bytes(self, data):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _route(self):
+                seen_auth.append(self.headers.get("Authorization"))
+                return urllib.parse.urlparse(self.path).path
+
+            def do_GET(self):
+                path = self._route()
+                if path == "/api/v1/competitions":
+                    return self._json({"items": [{
+                        "id": "C1", "title": "qualifier", "phase": "running",
+                        "kind": "jeopardy", "is_registered": True,
+                        "max_instances_per_team": 1,
+                        "max_instances_per_team_effective": 1,
+                    }], "total": 1, "limit": 200, "offset": 0})
+                if path == "/api/v1/competitions/C1":
+                    return self._json({
+                        "id": "C1", "title": "qualifier", "phase": "running",
+                        "max_instances_per_team_effective": 1,
+                    })
+                if path == "/api/v1/competitions/C1/challenges":
+                    return self._json({"items": [challenge], "total": 1,
+                                       "limit": 1000, "offset": 0})
+                if path == "/api/v1/challenges/AUTH-1":
+                    return self._json(challenge)
+                if path == "/api/v1/instances":
+                    items = [state["instance"]] if state["instance"] else []
+                    return self._json({"items": items, "total": len(items),
+                                       "limit": 1000, "offset": 0})
+                if path == "/api/v1/instances/I1":
+                    if not state["instance"]:
+                        return self._json({"code": "instance_not_found",
+                                           "detail": "gone"}, 404)
+                    if state["instance"]["status"] == "starting":
+                        state["instance"].update({
+                            "status": "ready",
+                            "entry_urls": ["http://10.0.0.5:8000"],
+                            "services": [{
+                                "service_type": "web", "host": "10.0.0.5",
+                                "port": 80, "access": "vpn", "label": "web",
+                                "path": "/", "credentials": {"user": "u", "pass": "p"},
+                            }],
+                            "vpn_backend": "wireguard",
+                            "expires_at": 1893456000, "ttl": 3600,
+                            "questions": [
+                                {"id": "flag1", "prompt": "p1",
+                                 "unlocked": True, "answered_correctly": False,
+                                 "attempts_remaining": 3, "attempts_cap": 3},
+                                {"id": "flag2", "prompt": "p2",
+                                 "requires": ["flag1"], "unlocked": True,
+                                 "answered_correctly": False,
+                                 "attempts_remaining": 2, "attempts_cap": 2},
+                            ],
+                        })
+                    return self._json(state["instance"])
+                if path == "/api/v1/instances/I1/vpn-config":
+                    return self._bytes(b"[Interface]\nPrivateKey = x\n")
+                if path == "/api/v1/challenges/AUTH-1/attachments/welcome.txt":
+                    return self._bytes(b"hello")
+                if path == "/api/v1/challenges/AUTH-1/attachments/team.txt":
+                    return self._json({
+                        "code": "per_team_attachment",
+                        "detail": "start an instance and use the instance route",
+                    }, 409)
+                if path == "/api/v1/instances/I1/attachments/team.txt":
+                    return self._bytes(b"team")
+                return self._json({"code": "not_found", "detail": path}, 404)
+
+            def do_POST(self):
+                path = self._route()
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length)) if length else None
+                if path == "/api/v1/instances":
+                    state["start_posts"] += 1
+                    state["instance"] = {
+                        "id": "I1", "challenge_id": "AUTH-1",
+                        "competition_id": "C1", "status": "starting",
+                        "entry_urls": [], "services": [], "questions": [],
+                        "started_at": 1,
+                    }
+                    return self._json({"id": "I1", "status": "starting",
+                                       "start_wait": {"queue_position": 1}}, 202)
+                if path == "/api/v1/submissions":
+                    state["submit_bodies"].append(body)
+                    return self._json({
+                        "id": "s1", "correct": True, "solve_rank": 1,
+                        "solve_time_s": 60, "question_id": body["question_id"],
+                        "challenge_fully_solved": False,
+                        "attempts_remaining": 2, "ranked": True,
+                        "unranked_reason": None,
+                    })
+                return self._json({"code": "not_found", "detail": path}, 404)
+
+            def do_DELETE(self):
+                path = self._route()
+                if path == "/api/v1/instances/I1":
+                    state["instance"]["status"] = "stopping"
+                    return self._json({"status": "stopping", "id": "I1",
+                                       "teardown_pending": True}, 202)
+                return self._json({"code": "not_found", "detail": path}, 404)
+
+        server = self._serve(Handler)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                client = arena.ArenaClient(
+                    f"http://127.0.0.1:{server.server_address[1]}/", "tok",
+                    platform="ctfy", competition_id="C1",
+                    state_file=Path(tmp) / "arena-instances.json",
+                    poll_interval=0.5, start_timeout=5,
+                    vpn_dir=Path(tmp) / "vpn",
+                    attachments_dir=Path(tmp) / "attachments",
+                )
+                self.assertEqual(client.base_url,
+                                 f"http://127.0.0.1:{server.server_address[1]}/api/v1")
+
+                chs = client.list_challenges()
+                self.assertEqual(chs[0]["unique_code"], "AUTH-1")
+                self.assertEqual(chs[0]["flag_count"], 2)
+                self.assertFalse(chs[0]["is_completed"])
+
+                cap = client.capacity()
+                self.assertEqual((cap["cap"], cap["active"]), (1, 0))
+
+                inst = client.start_challenge("AUTH-1")
+                self.assertEqual(inst["instance_id"], "I1")
+                self.assertIn("10.0.0.5:80", inst["container_addr"])
+                self.assertIn("http://10.0.0.5:8000", inst["container_addr"])
+
+                # a second spawn reuses the live instance: no extra POST
+                again = client.start_challenge("AUTH-1")
+                self.assertEqual(again["instance_id"], "I1")
+                self.assertEqual(state["start_posts"], 1)
+
+                # two open questions, no --question -> refuse (attempt safety)
+                with self.assertRaises(arena.ArenaError) as ctx:
+                    client.submit_flag("AUTH-1", "guess")
+                self.assertEqual(ctx.exception.code, "question_ambiguous")
+                self.assertEqual(state["submit_bodies"], [])
+
+                res = client.submit_flag(
+                    "AUTH-1", "a", question_id="flag1", answer=["a", "b"])
+                self.assertTrue(res["correct"])
+                self.assertEqual(res["question_id"], "flag1")
+                self.assertEqual(state["submit_bodies"][-1], {
+                    "instance_id": "I1", "question_id": "flag1",
+                    "answer": ["a", "b"],
+                })
+
+                att = client.download_attachments("AUTH-1")
+                self.assertEqual(sorted(f["name"] for f in att["files"]),
+                                 ["team.txt", "welcome.txt"])
+                self.assertEqual(att["errors"], [])
+                self.assertEqual(
+                    (Path(att["dir"]) / "welcome.txt").read_bytes(), b"hello")
+                self.assertEqual(
+                    (Path(att["dir"]) / "team.txt").read_bytes(), b"team")
+
+                vpn = client.download_vpn_config("AUTH-1")
+                self.assertEqual(vpn["backend"], "wireguard")
+                self.assertTrue(Path(vpn["path"]).read_bytes().startswith(
+                    b"[Interface]"))
+
+                closed = client.close_challenge("AUTH-1")
+                self.assertTrue(closed["closed"])
+                self.assertEqual(closed["instance_id"], "I1")
+                state_doc = json.loads(
+                    (Path(tmp) / "arena-instances.json").read_text(encoding="utf-8"))
+                self.assertEqual(
+                    state_doc["instances"]["AUTH-1"]["status"], "stopping")
+        finally:
+            server.shutdown()
+
+        self.assertTrue(seen_auth)
+        self.assertTrue(all(a == "Bearer tok" for a in seen_auth), seen_auth)
+
+    def test_capacity_precheck_refuses_without_post(self):
+        from http.server import BaseHTTPRequestHandler
+        arena = self._arena()
+        posts = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, obj, code=200):
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                import urllib.parse
+                parsed = urllib.parse.urlparse(self.path)
+                path = parsed.path
+                query = urllib.parse.parse_qs(parsed.query)
+                if path == "/api/v1/instances":
+                    if query.get("challenge_id") == ["AUTH-2"]:
+                        return self._json({"items": []})
+                    return self._json({"items": [{
+                        "id": "IX", "challenge_id": "OTHER",
+                        "status": "ready", "questions": [],
+                    }]})
+                if path == "/api/v1/competitions/C1":
+                    return self._json({"id": "C1",
+                                       "max_instances_per_team_effective": 1})
+                return self._json({"code": "not_found"}, 404)
+
+            def do_POST(self):
+                posts.append(self.path)
+                return self._json({"id": "NEW", "status": "starting"})
+
+        server = self._serve(Handler)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                client = arena.ArenaClient(
+                    f"http://127.0.0.1:{server.server_address[1]}", "tok",
+                    platform="ctfy", competition_id="C1",
+                    state_file=Path(tmp) / "state.json")
+                with self.assertRaises(arena.ArenaError) as ctx:
+                    client.start_challenge("AUTH-2")
+                self.assertEqual(ctx.exception.code, "team_capacity_exceeded")
+                self.assertEqual(ctx.exception.status, 429)
+                self.assertEqual(posts, [])
+        finally:
+            server.shutdown()
+
+    def test_error_envelope_and_exhausted_question_guard(self):
+        from http.server import BaseHTTPRequestHandler
+        arena = self._arena()
+        posts = []
+        instance = {
+            "id": "I1", "challenge_id": "AUTH-1", "status": "ready",
+            "entry_urls": [], "services": [],
+            "questions": [
+                {"id": "flag1", "prompt": "p1", "unlocked": True,
+                 "answered_correctly": False, "attempts_remaining": 2},
+                {"id": "flag2", "prompt": "p2", "unlocked": True,
+                 "answered_correctly": False, "attempts_remaining": 0},
+            ],
+        }
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, obj, code=200):
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/v1/instances":
+                    return self._json({"items": [instance]})
+                if path == "/api/v1/instances/I1":
+                    return self._json(instance)
+                return self._json({"code": "not_found"}, 404)
+
+            def do_POST(self):
+                posts.append(self.path)
+                return self._json({
+                    "code": "question_locked",
+                    "detail": {"message": "question flag1 is locked",
+                               "requires": ["flag0"]},
+                }, 403)
+
+        server = self._serve(Handler)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                client = arena.ArenaClient(
+                    f"http://127.0.0.1:{server.server_address[1]}", "tok",
+                    platform="ctfy", competition_id="C1",
+                    state_file=Path(tmp) / "state.json")
+                # attempts_remaining == 0 is refused locally, no HTTP POST
+                with self.assertRaises(arena.ArenaError) as ctx:
+                    client.submit_flag("AUTH-1", "x", question_id="flag2")
+                self.assertEqual(ctx.exception.code, "question_attempt_cap_exceeded")
+                self.assertEqual(posts, [])
+                # a platform 403 keeps its envelope code for deferral logic
+                with self.assertRaises(arena.ArenaError) as ctx:
+                    client.submit_flag("AUTH-1", "x", question_id="flag1")
+                self.assertEqual(ctx.exception.code, "question_locked")
+                self.assertEqual(ctx.exception.status, 403)
+        finally:
+            server.shutdown()
+
+    def test_vpn_topology_detection_and_config_helpers(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=Path(tmp) / "state.json")
+            self.assertTrue(client._needs_vpn({"network_topology": "engagement"}))
+            self.assertTrue(client._needs_vpn({
+                "vpn_endpoint": {"config_url": "https://example/vpn"}}))
+            self.assertTrue(client._needs_vpn({"vpn_backend": "wireguard"}))
+            self.assertTrue(client._needs_vpn({
+                "services": [{"host": "a.internal", "access": "vpn"}],
+                "entry_urls": [],
+            }))
+            self.assertFalse(client._needs_vpn({
+                "network_topology": "simple",
+                "entry_urls": ["https://public.example/"],
+                "services": [{"host": "public.example", "access": None}],
+            }))
+            # topology=simple is authoritative over a generic vpn_backend field
+            self.assertFalse(client._needs_vpn({
+                "network_topology": "simple",
+                "vpn_backend": "wireguard",
+                "entry_urls": ["https://public.example/"],
+                "services": [{"host": "public.example",
+                              "access": "public_port"}],
+            }))
+            inst = {
+                "entry_urls": ["http://a.internal:8080/x",
+                               "http://a.internal/dup"],
+                "services": [{"host": "a.internal"},
+                             {"host": "b.internal."},
+                             {"host": "public.example"}],
+            }
+            self.assertEqual(client._internal_hostnames(inst),
+                             ["a.internal", "b.internal"])
+
+            config = (
+                "[Interface]\nPrivateKey = secret\n"
+                "Address = 10.0.0.2/32\n"
+                "DNS = 172.16.8.3, 1.1.1.1, search.example\n\n"
+                "[Peer]\nAllowedIPs = 172.16.8.0/24\n"
+            )
+            self.assertEqual(client._wg_dns_servers(config),
+                             ["172.16.8.3", "1.1.1.1"])
+            cleaned = client._strip_wg_dns(config)
+            self.assertNotIn("DNS", cleaned)
+            self.assertIn("PrivateKey", cleaned)
+            self.assertIn("AllowedIPs", cleaned)
+
+    def test_download_vpn_config_skips_direct_instances(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=root / "state.json")
+            inst = {
+                "id": "I9", "network_topology": "simple",
+                "entry_urls": ["https://public.example/"],
+                "services": [{"host": "public.example",
+                              "access": "public_port"}],
+            }
+            with mock.patch.object(client, "_resolve_instance",
+                                   return_value=inst), \
+                 mock.patch.object(client, "_request_bytes") as raw:
+                result = client.download_vpn_config("PUB-1", up=True)
+            self.assertFalse(result["needs_vpn"])
+            self.assertIn("skipped", result)
+            self.assertIsNone(result["path"])
+            raw.assert_not_called()
+            state = json.loads((root / "state.json").read_text(
+                encoding="utf-8"))
+            self.assertFalse(state["vpn"]["PUB-1"]["up"])
+
+    def test_vpn_up_strips_dns_maps_internal_and_records_state(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captured = {}
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=root / "state.json",
+                vpn_dir=root / "vpn")
+            config = root / "orig.conf"
+            config.write_text(
+                "[Interface]\nPrivateKey = not-a-real-key\n"
+                "Address = 10.0.0.2/32\nDNS = 172.16.8.3\n\n"
+                "[Peer]\nAllowedIPs = 172.16.8.0/24\n", encoding="utf-8")
+            inst = {
+                "id": "I1", "challenge_id": "AUTH-1",
+                "network_topology": "engagement",
+                "entry_urls": ["http://a.internal:8080/"],
+                "services": [{"host": "a.internal", "port": 8080,
+                              "access": "vpn"}],
+                "vpn_backend": "wireguard",
+                "vpn_endpoint": {"host": "vpn.example", "port": 51820},
+            }
+            calls = []
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return Proc()
+
+            def fake_which(name):
+                # Windows dev boxes and CI images may not ship wireguard-tools;
+                # the test must not depend on the host's binaries.
+                return f"/usr/bin/{name}" if name in ("wg-quick", "sudo") else None
+
+            with mock.patch.object(client, "_run_vpn_command",
+                                   side_effect=fake_run), \
+                 mock.patch.object(arena.shutil, "which",
+                                   side_effect=fake_which), \
+                 mock.patch.object(client, "_wait_interface",
+                                   return_value=True), \
+                 mock.patch.object(client, "_resolve_internal_host",
+                                   return_value=(["172.16.8.9"], "")), \
+                 mock.patch.object(client, "_read_hosts_text",
+                                   return_value="127.0.0.1 localhost\n"), \
+                 mock.patch.object(client, "_write_hosts_text",
+                                   side_effect=lambda text: captured.update(
+                                       hosts=text)):
+                result = client.vpn_up(config, instance=inst, code="AUTH-1")
+
+            self.assertTrue(result["ok"])
+            stem = "sapper-" + hashlib.sha1(b"AUTH-1").hexdigest()[:8]
+            self.assertEqual(Path(result["effective_path"]).name,
+                             stem + ".conf")
+            effective = Path(result["effective_path"]).read_text(
+                encoding="utf-8")
+            self.assertNotIn("DNS", effective)
+            self.assertIn("AllowedIPs", effective)
+            # the downloaded original must stay untouched for re-import
+            self.assertIn("DNS = 172.16.8.3",
+                          config.read_text(encoding="utf-8"))
+            self.assertIn("# BEGIN sapper-vpn I1", captured["hosts"])
+            self.assertIn("172.16.8.9 a.internal", captured["hosts"])
+            self.assertEqual(result["dns_servers"], ["172.16.8.3"])
+            self.assertTrue(any("wg-quick" in " ".join(cmd)
+                                for cmd in calls))
+            state = json.loads((root / "state.json").read_text(
+                encoding="utf-8"))
+            self.assertTrue(state["vpn"]["AUTH-1"]["up"])
+            self.assertEqual(state["vpn"]["AUTH-1"]["interface"], stem)
+
+    def test_vpn_up_reuses_live_tunnel_for_the_same_instance(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=root / "state.json",
+                vpn_dir=root / "vpn")
+            stem = "sapper-" + hashlib.sha1(b"AUTH-1").hexdigest()[:8]
+            effective = root / "vpn" / ".up" / f"{stem}.conf"
+            client._remember_vpn("AUTH-1", {
+                "up": True, "instance_id": "I1", "backend": "wireguard",
+                "interface": stem, "hosts_tag": "I1",
+                "effective_path": str(effective),
+                "config_path": str(root / "vpn" / f"{stem}.conf"),
+            })
+            config = root / "orig.conf"
+            config.write_text("[Interface]\nPrivateKey = x\n\n[Peer]\n"
+                              "AllowedIPs = 172.16.8.0/24\n", encoding="utf-8")
+            calls = []
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return Proc()
+
+            with mock.patch.object(client, "_iface_exists",
+                                   return_value=True), \
+                 mock.patch.object(arena.shutil, "which",
+                                   side_effect=lambda name: f"/usr/bin/{name}"), \
+                 mock.patch.object(client, "_run_vpn_command",
+                                   side_effect=fake_run):
+                result = client.vpn_up(config, instance={"id": "I1"},
+                                       code="AUTH-1")
+
+            self.assertTrue(result["already_up"])
+            self.assertTrue(result["up"])
+            self.assertEqual(calls, [])
+            # the cleaned copy is refreshed even when the tunnel is reused
+            self.assertTrue(effective.exists())
+
+    def test_vpn_up_replaces_stale_tunnel_from_an_older_instance(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=root / "state.json",
+                vpn_dir=root / "vpn")
+            stem = "sapper-" + hashlib.sha1(b"AUTH-1").hexdigest()[:8]
+            effective = root / "vpn" / ".up" / f"{stem}.conf"
+            client._remember_vpn("AUTH-1", {
+                "up": True, "instance_id": "I0", "backend": "wireguard",
+                "interface": stem, "hosts_tag": "I0",
+                "effective_path": str(effective),
+                "config_path": str(root / "vpn" / f"{stem}.conf"),
+            })
+            config = root / "orig.conf"
+            config.write_text("[Interface]\nPrivateKey = x\n\n[Peer]\n"
+                              "AllowedIPs = 172.16.9.0/24\n", encoding="utf-8")
+            calls = []
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return Proc()
+
+            with mock.patch.object(client, "_iface_exists",
+                                   return_value=True), \
+                 mock.patch.object(arena.shutil, "which",
+                                   side_effect=lambda name: f"/usr/bin/{name}"), \
+                 mock.patch.object(client, "_run_vpn_command",
+                                   side_effect=fake_run), \
+                 mock.patch.object(client, "_wait_interface",
+                                   return_value=True):
+                result = client.vpn_up(config, instance={"id": "I1"},
+                                       code="AUTH-1")
+
+            sequences = [" ".join(cmd) for cmd in calls]
+            down_at = next(i for i, s in enumerate(sequences) if " down " in s)
+            up_at = next(i for i, s in enumerate(sequences) if " up " in s)
+            self.assertLess(down_at, up_at)
+            self.assertFalse(result.get("already_up"))
+            state = json.loads((root / "state.json").read_text(
+                encoding="utf-8"))
+            self.assertEqual(state["vpn"]["AUTH-1"]["instance_id"], "I1")
+
+    def test_vpn_down_removes_marked_hosts_block_and_closes_state(self):
+        arena = self._arena()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captured = {}
+            client = arena.ArenaClient(
+                "http://127.0.0.1:1", "tok", platform="ctfy",
+                competition_id="C1", state_file=root / "state.json",
+                vpn_dir=root / "vpn")
+            stem = "sapper-" + hashlib.sha1(b"AUTH-1").hexdigest()[:8]
+            client._remember_vpn("AUTH-1", {
+                "up": True, "instance_id": "I1", "backend": "wireguard",
+                "interface": stem, "hosts_tag": "I1",
+                "config_path": str(root / "orig.conf"),
+            })
+            hosts_before = (
+                "127.0.0.1 localhost\n"
+                "# BEGIN sapper-vpn I1\n"
+                "172.16.8.9 a.internal\n"
+                "# END sapper-vpn I1\n"
+                "# keep-tail\n"
+            )
+            calls = []
+
+            class Proc:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(cmd, **kwargs):
+                calls.append(cmd)
+                return Proc()
+
+            def fake_which(name):
+                return f"/usr/bin/{name}" if name in ("wg-quick", "sudo") else None
+
+            with mock.patch.object(client, "_run_vpn_command",
+                                   side_effect=fake_run), \
+                 mock.patch.object(arena.shutil, "which",
+                                   side_effect=fake_which), \
+                 mock.patch.object(client, "_read_hosts_text",
+                                   return_value=hosts_before), \
+                 mock.patch.object(client, "_write_hosts_text",
+                                   side_effect=lambda text: captured.update(
+                                       hosts=text)):
+                result = client.vpn_down(code="AUTH-1")
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["up"])
+            self.assertNotIn("a.internal", captured["hosts"])
+            self.assertIn("# keep-tail", captured["hosts"])
+            self.assertTrue(any("wg-quick" in " ".join(cmd) and "down" in cmd
+                                for cmd in calls))
+            state = json.loads((root / "state.json").read_text(
+                encoding="utf-8"))
+            self.assertFalse(state["vpn"]["AUTH-1"]["up"])
+
+    def test_load_ctfy_env_and_template(self):
+        arena = self._arena()
+        env = {"SAPPER_PLATFORM": "ctfy",
+               "CTFY_BASE_URL": "https://ctfy.example.test",
+               "CTFY_TOKEN": "tok", "CTFY_COMPETITION_ID": "C1"}
+        with mock.patch.dict("os.environ", env, clear=True):
+            c = arena.ArenaClient.load(None)
+            self.assertEqual(c.platform, "ctfy")
+            self.assertEqual(c.base_url, "https://ctfy.example.test/api/v1")
+            self.assertEqual(c.competition_id, "C1")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", env, clear=True):
+                path = arena.ArenaClient.write_template(Path(tmp))
+                cfg = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(cfg["platform"], "ctfy")
+                self.assertEqual(cfg["token"], "ENV:CTFY_TOKEN")
 
 
 class CommanderTests(unittest.TestCase):

@@ -13,14 +13,27 @@ tmux session "sapper-cmd"
   window "watchdog"      — the dumb guardian script (stays in window 0? no: runs detached via nohup)
 ROOT=/work/runs (SAPPER_ROOT)
   <code>/               — challenge home; .sapper/ fact graph lives here
+  <code>/.sapper/brief.md — authoritative target brief (instance, entry URLs,
+                          creds, VPN, every question id/prompt/state)
+  <code>/attachments/   — challenge/instance attachments (CTFy)
+  <code>/vpn/           — per-challenge VPN client config (CTFy)
   <code>-w2/            — second agent on same challenge: .sapper -> ../<code>/.sapper SYMLINK
   commander-state.md    — commander's self-maintained campaign state (handover doc)
+  arena-instances.json  — CTFy live-instance cache (atomic, chmod 600)
   drive.log             — watchdog log
 ```
 
 ## Environment
 
-Same env vars as tmux version: `BENCHMARK_BASE_URL/TOKEN`, `ANTHROPIC_BASE_URL/AUTH_TOKEN`,
+Two challenge-platform backends, selected by `SAPPER_PLATFORM` (`ctfy|tsecbench`)
+or inferred from env (BENCHMARK_* wins when both are present; see lib/arena.py):
+- TSecBench: `BENCHMARK_BASE_URL/TOKEN`.
+- CTFy/TPCTF: `CTFY_BASE_URL` (default `https://ctfy.tsinghua.edu.cn/api/v1`),
+  `CTFY_TOKEN` (Bearer), optional `CTFY_COMPETITION_ID` (auto-selected when the
+  team has exactly one registered running competition), `CTFY_VERIFY_TLS=0` to
+  skip verification.
+
+Model env: `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`,
 `SAPPER_KEY_POOL` (JSON array), `SAPPER_TOTAL_MINUTES` (default 470),
 `SAPPER_MAX_WORKERS` (default 8 — hard pane cap).
 
@@ -37,8 +50,13 @@ Same env vars as tmux version: `BENCHMARK_BASE_URL/TOKEN`, `ANTHROPIC_BASE_URL/A
   the original tier is no longer served (pragmatic: keep pane's tier unless provider
   changed base_url family — simplest: relaunch uses rotated.env SAPPER_MODEL).
 
-Platform constraint: **max 3 concurrently active challenge instances** (HTTP 409 "max active"
-otherwise). Multiple agent panes on the SAME challenge share ONE instance.
+Platform constraint: the per-team instance cap is platform-reported
+(`max_instances_per_team_effective`: CTFy qualifiers 1, prelim/final 3;
+TSecBench 3). `worker.sh board` shows `instances=active/cap` from
+`ArenaClient.describe()`. Multiple agent panes on the SAME challenge share ONE
+instance. CTFy instances are question-level: a challenge may have several
+questions (`flag1`, `flag2`, ...), each with its own attempt cap and `requires`
+unlocks; a running instance is required for submission.
 
 ## Unit 1: worker.sh — the commander's hands (called BY the commander)
 
@@ -47,10 +65,30 @@ Must be idempotent and safe to call repeatedly. No main loop — one-shot comman
 
 ### `spawn <code> [--tui|--p] [--mission "..."] [--minutes N] [--name NAME] [--model <id>]`
 1. If no live pane named `<code>-w*` exists for this code AND platform instance not started:
-   `arena start <code>` (reuse arena() inline-python helper from tmux-drive.sh).
-   If HTTP 409 "max active": print friendly error `PLATFORM CAP: close a challenge first`
-   and exit 3 (SKILL teaches commander to expect this).
-   Extract `container_addr`.
+   `arena start <code>` (reuse arena() inline-python helper; WATCHDOG/worker share the
+   same helper contract).
+   - TSecBench: start has the legacy one-flag semantics; HTTP 409 "max active" →
+     friendly `PLATFORM CAP: close a challenge first`, exit 3.
+   - CTFy: reuse an already-live instance for the challenge (`GET /instances`),
+     local capacity pre-check against `max_instances_per_team_effective`, POST
+     `/instances`, poll `starting`→`ready`, persist to `ROOT/arena-instances.json`.
+     `team_capacity_exceeded`/409 also → exit 3. `container_addr` is synthesized
+     from `entry_urls` + service `host:port`; VPN-only targets may have none — that
+     is NOT a failure (see 1b).
+   - Exit 3 message mentions the live `instances=x/y` gauge.
+1b. CTFy artifacts (best effort, non-fatal): write `ROOT/<code>/.instance.json`,
+   `ROOT/<code>/.sapper/brief.md` (instance id, entry URLs, credentials, VPN
+   status, question ids/prompts/unlock/attempt state, exact submit commands),
+   download attachments to `ROOT/<code>/attachments/`, VPN config to
+   `ROOT/<code>/vpn/sapper-<hash8>.conf`.  With `SAPPER_VPN_AUTO=1` (default)
+   the per-challenge WireGuard tunnel is brought up immediately: `DNS =` is
+   stripped so wg-quick cannot replace the container resolver (the model
+   gateway still needs public DNS), and `*.internal` targets are resolved
+   through the tunnel's DNS into a marked `/etc/hosts` block.  Needs
+   `--cap-add=NET_ADMIN`; the image grants passwordless sudo only for
+   `wg-quick` and `tee /etc/hosts`.  Failures are logged and never block the
+   pane.  Direct-access instances (`network_topology=simple`) skip the tunnel
+   entirely.  `SAPPER_VPN_AUTO=0` restores download-only behaviour.
 2. Prepare dirs: if primary agent (`-w1`): `mkdir -p ROOT/<code>`, `sapper init --goal "solve <code>..."`.
    If secondary (`-w2+`): `mkdir -p ROOT/<code>-wN`, `ln -sfn ../<code>/.sapper ROOT/<code>-wN/.sapper`.
 3. Trust preset (copy the PYTRUST block + settings.json from tmux-drive.sh launch()).
@@ -76,6 +114,7 @@ NO other pane of that code remains alive).
 
 ### `board` — the war board. Aggregate:
 - platform: `arena list` → per code: completed yes/no, flag counts
+- capacity: `arena info` → `instances=active/cap` in the header, heartbeat, and --json
 - graph: for each ROOT/*/. sapper/project.json → count facts by kind, open intents, flag facts
   with status recorded/submitted, latest fact mtime
 - panes: worker list merged in
@@ -108,8 +147,11 @@ Responsibilities IN ORDER per sweep:
    (restarts map), budget-independent. -p workers exited = normal completion: leave the pane
    (commander reads result via peek, kills via worker.sh kill).
 6. **Global deadline** (SAPPER_TOTAL_MINUTES from script start) → C-c all worker panes,
-   finish_flags for EVERY code with a graph, arena close every open instance, log summary,
-   exit 0. This is the failsafe finish when the commander is dead at the buzzer.
+   finish_flags for EVERY code with a graph (question/instance-aware; deferrable CTFy
+   errors leave the fact `recorded` instead of falsely `rejected`), close every live
+   CTFy instance (`arena active`, exact instance id) plus every non-completed TSecBench
+   challenge, log summary, exit 0. This is the failsafe finish when the commander is
+   dead at the buzzer.
 7. Worker TUI stall (no pane change > SAPPER_STALL_SECONDS=600) → do NOTHING (nudging is the
    commander's job; watchdog only keeps processes alive).
 
@@ -120,9 +162,10 @@ Startup: `mkdir -p ROOT`, log env summary, ensure tmux session exists (`tmux new
 
 Frontmatter-free markdown, injected path /opt/sapper/docker/commander/SKILL.md. Sections:
 
-1. **Role**: field commander of an autonomous pentest engagement (TSecBench, 50-63 challenges,
-   8h). You command workers; you NEVER run recon/exploit commands yourself. Your tools:
-   `worker.sh` (hands) + `sapper` CLI (graph/arena/flag/kb) + reading panes.
+1. **Role**: field commander of an autonomous pentest engagement on a CTF
+   challenge platform (TSecBench or CTFy/TPCTF, 8h). You command workers; you NEVER
+   run recon/exploit commands yourself. Your tools: `worker.sh` (hands) + `sapper`
+   CLI (graph/arena/flag/kb) + reading panes + `ROOT/<code>/.sapper/brief.md`.
 2. **The loop** (run forever until deadline): `worker.sh board` → think (who's stuck? who's
    close? what intel transfers?) → act (spawn/msg/hint/kill) → `sleep 60-120` → repeat.
    Iteration cadence: ~1-2 min. Always re-read board fresh; never assume.
@@ -131,21 +174,29 @@ Frontmatter-free markdown, injected path /opt/sapper/docker/commander/SKILL.md. 
 4. **Doctrine**:
    - Score locks at first solve: sweep EASY first (e-series look easier than f2-). Get the
      cheap board coverage before burning hours on hard chains.
-   - Platform cap: 3 concurrent challenge INSTANCES. Panes are free (up to
+   - Platform cap: platform-reported per-team instance cap (board `instances=x/y`;
+     CTFy qualifiers 1, prelim/final 3). Panes are free (up to
      SAPPER_MAX_WORKERS=8); instances are not. Closing a challenge frees its instance.
    - Same-challenge multi-agent: spawn w2 with a DIFFERENT angle ("w2: try source-code
      audit path while w1 continues black-box"). They share the fact graph — w2 sees w1's
      facts. Tell workers this.
    - Worker forms: TUI for deep attacks (session persists), `-p --minutes N` for bounded
      chores (recon sweep, verify a guess). -p results appear in the pane; peek then kill.
+   - Brief first: every worker reads `ROOT/<code>/.sapper/brief.md` before touching
+     the target. It carries instance id, entry URLs, credentials, VPN transport, and
+     question ids — the mission text must repeat the exact submit command for the
+     question(s) being attacked.
    - Intel transfer: when a worker confirms a technique ("filter bypasses on ×\\u003cscript×"),
      `worker.sh hint <other-code> "[commander] e-series WAF bypass works: ..."` + msg the
      working pane. Same product+version across hosts ⇒ same CVE.
    - Stuck ladder (per challenge): tactical msg → +w2 different angle → declare parked
      (kill panes, close instance, move on). Don't let 3 hard challenges eat the clock.
-   - Flags: workers submit via `sapper flag ... --submit` themselves. Your job: verify on
-     board that recorded flags got submitted; re-run finish on close.
-   - NEVER attack the platform API/scoring infra. Scope = challenge containers only.
+   - Flags: workers submit question-level via
+     `sapper flag "<answer>" -c <code> --question <qid> --submit` themselves (arrays
+     add `--answer-json`). Your job: verify on board that recorded flags got submitted;
+     re-run finish on close. NEVER guess: wrong answers burn attempt budget.
+   - NEVER attack the platform API/scoring/VPN infrastructure, challenge authoring,
+     or another team's instances. Scope = your team's briefed challenge containers.
 5. **Self-management (CRITICAL)**: your context is finite. Every ~10 loop iterations (or when
    you feel context pressure / auto-compact warnings), rewrite `ROOT/commander-state.md`:
    current instance allocation, per-challenge status table (code | status | panes | next move |
@@ -161,10 +212,13 @@ Tone: imperative, checklist-heavy, no fluff. The commander model is glm-5.3-flas
 instructions literal and unambiguous, avoid judgment calls requiring nuance.
 
 ## entrypoint.sh (unit 4, trivial)
-Env check (BENCHMARK_*/ANTHROPIC_* mandatory) → platform reachability + GLM smoke (copy from
-entrypoint-tmux.sh) → tmux new-session -d -s sapper-cmd -n commander → `nohup watchdog.sh &`
-→ spawn commander claude TUI in window 0 (cwd ROOT/commander-home) with bootstrap prompt.
-Container CMD stays foreground on the watchdog (tmux attach alternative: `tail -f drive.log`).
+Env check (BENCHMARK_* or CTFY_* depending on `SAPPER_PLATFORM`; platform token
+mandatory; ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY) → platform reachability
+(`/openapi/v1/challenges` with BENCHMARK_TOKEN, or `/api/v1/competitions` with
+Bearer) + model smoke → tmux new-session -d -s sapper-cmd -n commander →
+`nohup watchdog.sh &` → spawn commander claude TUI in window 0 (cwd
+ROOT/commander-home) with bootstrap prompt. Container CMD stays foreground on the
+watchdog (tmux attach alternative: `tail -f drive.log`).
 
 ## Dockerfile.commander
 FROM sapper-agent:tmux (inherits everything), COPY docker/commander/* to /opt/sapper/docker/commander/,
@@ -177,3 +231,17 @@ chmod +x worker.sh watchdog.sh entrypoint.sh, ENTRYPOINT entrypoint.sh.
 - arena HTTP 409 must never crash a loop → every arena call in `|| true` + message check
 - bash assoc arrays for string-keyed maps → declare -A
 - worker panes must end with `echo DRIVE_PANE_EXITED; exec sleep infinity` so death is detectable
+- CTFy state file is shared by worker.sh/watchdog/CLI: export SAPPER_ROOT before any
+  `ArenaClient.load(None)` or the instance cache lives in the wrong home
+- CTFy flags are per-question and per-team-per-instance: never auto-submit when more
+  than one question is open, never guess, never reuse another instance's answer
+- `per_team` attachments return 409 on the challenge route → retry the instance route
+- VPN interface names cap at 15 chars: configs use `sapper-<hash8>.conf`; the
+  cleaned wg config lives under `vpn/.up/` with the same short stem. Concurrent
+  instances get distinct interfaces/routes (the platform hands each a separate
+  `AllowedIPs` /24)
+- Never feed wg-quick a config with `DNS =`: it rewrites `/etc/resolv.conf` and
+  breaks the public model gateway. Strip it, then resolve `*.internal` through
+  the tunnel DNS into `/etc/hosts`; `vpn-down` removes the marked block
+- A failed tunnel is transport failure, not challenge failure: worker logs it,
+  the brief says the tunnel is not up, and public/direct targets still work

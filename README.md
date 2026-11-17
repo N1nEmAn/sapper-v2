@@ -44,7 +44,7 @@ scenario (office, research, engineering, any long-horizon cooperative work):
 - **Start from [nvwabase · the Nüwa Foundation](https://github.com/N1nEmAn/nvwabase)** — the general-purpose base with all three capabilities, no pentest doctrine, ready for you to iterate your own division of labor
 - **Or fork this project** — but the doctrine is NOT the only thing to change; the environment wiring must change too:
   - `docker/commander/SKILL.md` (the 426-line doctrine) → your scenario's strategy
-  - `BENCHMARK_BASE_URL` and related platform env vars → the competition engine hard-verifies the arena API at boot (that's why configuring only a model key without a platform address yields `BENCHMARK_BASE_URL is not set`); running off the competition platform means providing or stubbing that platform interface yourself
+  - `BENCHMARK_BASE_URL` / `CTFY_BASE_URL` and related platform env vars → the competition engine hard-verifies the arena API at boot (that's why configuring only a model key without a platform address yields `BENCHMARK_BASE_URL is not set`); running off the competition platform means providing or stubbing that platform interface yourself. Both TSecBench (`BENCHMARK_*`) and TPCTF/CTFy (`CTFY_*`) backends ship in `lib/arena.py`
   - model gateway & key env vars (`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `SAPPER_MODEL` / `SAPPER_KEY_POOL` ...) → your own model services
   - watchdog budget/deadline and report templates → adjust to your scenario
 - With AI, everything is flexible — even the doctrine can be rewritten with AI's help
@@ -255,6 +255,37 @@ docker load < sapper-v18-mixed.tar.gz
 ```
 
 Environment variables (model gateways / key pool / budget): [docker/ENV.md](docker/ENV.md).
+
+TPCTF 2026 / CTFy quickstart (the same image also supports TSecBench):
+
+> The CTFy backend and VPN wiring were added after the v18 release: build from
+> source (Option A above). The pre-built v18-champion image predates them.
+
+```bash
+docker run --rm -it --cap-add=NET_ADMIN \
+  -e SAPPER_PLATFORM=ctfy \
+  -e CTFY_BASE_URL=https://ctfy.tsinghua.edu.cn/api/v1 \
+  -e CTFY_TOKEN="$CTFY_TOKEN" \
+  -e CTFY_COMPETITION_ID="$CTFY_COMPETITION_ID" \
+  -e ANTHROPIC_BASE_URL="$GATEWAY_URL" -e ANTHROPIC_API_KEY="$GATEWAY_KEY" \
+  -e SAPPER_TOTAL_MINUTES=470 \
+  -v "$PWD/runs:/work/runs" sapper:latest
+```
+
+- Instance caps are read live (`instances=active/cap` on the board): qualifier 1,
+  prelim/final 3.
+- Flags are per question: `sapper flag "<answer>" -c <challenge> --question <qid> --submit`
+  (arrays: `--answer-json`). Workers read `.sapper/brief.md` for ids, entry points,
+  credentials, attachments and VPN transport.
+- Interactive challenges are WireGuard-only. On spawn, `worker.sh` downloads the
+  per-instance config and — unless `SAPPER_VPN_AUTO=0` — brings it up after
+  stripping `DNS =` (so wg-quick cannot break the public resolver the model
+  gateway needs) and resolving `*.internal` targets into `/etc/hosts`.
+  Direct-access instances (`network_topology=simple`) skip the tunnel. This is
+  why the container needs `--cap-add=NET_ADMIN`; the image grants passwordless
+  sudo only for `wg-quick` and `tee /etc/hosts`. `sapper arena vpn <challenge>
+  --down` tears it down; the watchdog does so at the deadline.
+- Never point the agent at the platform API, scoring, VPN gateway or other teams.
 
 Single-graph operation, the fact-intent CLI, and multi-challenge sweeps:
 see [SKILL.md](SKILL.md).
