@@ -23,6 +23,19 @@ from opencode_engine import OpenCodeEngine  # noqa: E402
 FIXTURE = ROOT / "tests" / "fixtures" / "opencode_events.ndjson"
 
 
+def _success_lines():
+    return [
+        _line({
+            "type": "session.text.ended",
+            "sessionID": "ses_test",
+            "data": {
+                "assistantMessageID": "msg_test",
+                "text": "test response",
+            },
+        })
+    ]
+
+
 def _fixture_lines():
     return FIXTURE.read_text(encoding="utf-8").splitlines()
 
@@ -177,16 +190,18 @@ class NormalizationTests(unittest.TestCase):
             "sessionID": "ses_test",
         })
 
-    def test_no_text_events_returns_empty_result(self):
+    def test_no_text_events_fails_with_clear_error(self):
         lines = [
             _line({"type": "session.created", "sessionID": "ses_empty"}),
             _line({"type": "session.idle", "sessionID": "ses_empty"}),
         ]
         factory, _ = _popen_factory(lines)
         with mock.patch.dict("os.environ", _ENV_CLEAN):
-            result = _engine(factory).run(_request())
-        self.assertEqual(result.result, "")
-        self.assertEqual(result.session_id, "ses_empty")
+            with self.assertRaisesRegex(
+                sapper.FGError,
+                "opencode returned no assistant text",
+            ):
+                _engine(factory).run(_request())
 
     def test_error_event_is_controlled_failure(self):
         lines = [_line({"type": "error", "sessionID": "ses_e",
@@ -263,7 +278,7 @@ class ProcessHandlingTests(unittest.TestCase):
             "SAPPER_OPENCODE_ARCHIVED": "1",
             "SAPPER_OPENCODE_STANDALONE": "1",
         })
-        factory, created = _popen_factory([])
+        factory, created = _popen_factory(_success_lines())
         with mock.patch.dict("os.environ", env), \
              contextlib.redirect_stderr(io.StringIO()):
             _engine(factory).run(_request(skip_permissions=True))
@@ -277,7 +292,7 @@ class ProcessHandlingTests(unittest.TestCase):
             self.assertNotIn(forbidden, argv)
 
     def test_no_opencode_model_config_ignores_request_model(self):
-        factory, created = _popen_factory([])
+        factory, created = _popen_factory(_success_lines())
         with mock.patch.dict("os.environ", _ENV_CLEAN):
             _engine(factory).run(_request(model="glm-5.3-flash[1m]"))
         argv = created[0].argv
@@ -285,7 +300,7 @@ class ProcessHandlingTests(unittest.TestCase):
         self.assertNotIn("glm-5.3-flash[1m]", argv)
 
     def test_append_system_is_delimited_in_prompt(self):
-        factory, created = _popen_factory([])
+        factory, created = _popen_factory(_success_lines())
         with mock.patch.dict("os.environ", _ENV_CLEAN):
             _engine(factory).run(_request(append_system="TRUSTED RULES"))
         prompt = created[0].argv[-1]
@@ -295,7 +310,7 @@ class ProcessHandlingTests(unittest.TestCase):
         self.assertIn("PROMPT", prompt)
 
     def test_skip_permissions_emits_warning_but_no_flag(self):
-        factory, created = _popen_factory([])
+        factory, created = _popen_factory(_success_lines())
         with mock.patch.dict("os.environ", _ENV_CLEAN), \
              contextlib.redirect_stderr(io.StringIO()) as err:
             _engine(factory).run(_request(skip_permissions=True))

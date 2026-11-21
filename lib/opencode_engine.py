@@ -337,4 +337,11 @@ class OpenCodeEngine:
             raise self._error_cls("opencode timeout must be at least 1 second")
         argv, engine = self._argv(request)
         out_lines, _stderr = self._collect(request, argv, engine)
-        return self._normalize(self._parse_lines(out_lines, engine), engine)
+        result = self._normalize(self._parse_lines(out_lines, engine), engine)
+
+        if not result.result.strip():
+            raise self._error_cls(
+                "opencode returned no assistant text; refusing empty response"
+            )
+
+        return result
