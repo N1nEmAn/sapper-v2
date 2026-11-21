@@ -35,6 +35,11 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+try:  # script / tests: lib/ is on sys.path
+    from engines import ClaudeEngine, EngineRequest, select_engine
+except ImportError:  # package-style import (python -m lib.sapper)
+    from .engines import ClaudeEngine, EngineRequest, select_engine
+
 __version__ = "1.0.0"
 
 GOAL_ID = "goal"
@@ -1424,6 +1429,43 @@ def _rotate_key() -> bool:
     return True
 
 
+def run_engine(
+    prompt: str,
+    *,
+    model: str,
+    timeout: int,
+    skip_permissions: bool,
+    append_system: str | None,
+    cwd: Path,
+) -> dict:
+    """Call the selected engine and return a Sapper-compatible envelope.
+
+    ``SAPPER_ENGINE`` selects the adapter. Claude (``claude -p --output-format
+    json``) is the default; OpenCode (``opencode run --format json``) is the
+    alternative engine. Both adapters return the same ``{"result": "..."}``
+    envelope expected by Sapper callers. Engine-specific settings (such as
+    the Claude-only ``SAPPER_BIN`` prefix and ``SAPPER_OPENCODE_*`` variables)
+    apply only to their respective engine, not to every engine.
+    """
+    engine = select_engine(
+        run_once=_run_engine_once,
+        is_quota_error=_is_quota_error,
+        rotate_key=_rotate_key,
+        error_cls=FGError,
+        sleep=time.sleep,
+    )
+    result = engine.run(EngineRequest(
+        prompt=prompt,
+        model=model,
+        timeout=timeout,
+        skip_permissions=skip_permissions,
+        append_system=append_system,
+        cwd=cwd,
+    ))
+    return result.to_envelope()
+
+
+
 def run_claude(
     prompt: str,
     *,
@@ -1433,56 +1475,15 @@ def run_claude(
     append_system: str | None,
     cwd: Path,
 ) -> dict:
-    """Call the agent CLI and return the parsed JSON result envelope.
-
-    The engine is `claude -p --output-format json` by default. Set
-    SAPPER_BIN to any command prefix (e.g. "codex-wrapper" or a script that
-    wraps another CLI) — it must accept the prompt on stdin and print a
-    claude-compatible envelope {"result": "..."} on stdout. --model and
-    --dangerously-skip-permissions / --append-system-prompt are appended
-    claude-style, so non-claude engines should ignore or translate them in
-    the wrapper."""
-    if timeout < 1:
-        raise FGError("claude timeout must be at least 1 second")
-    if not isinstance(model, str) or not model.strip():
-        raise FGError("claude model cannot be empty")
-    prefix = os.environ.get("SAPPER_BIN", "claude").split()
-    argv = prefix + [
-        "-p",
-        "--output-format", "json",
-        "--model", model,
-    ]
-    if skip_permissions:
-        argv.append("--dangerously-skip-permissions")
-    if append_system:
-        argv += ["--append-system-prompt", append_system]
-    engine = prefix[0]
-    attempts = 1 + max(0, int(os.environ.get("SAPPER_RETRY_MODEL", "0")))
-    last_error: FGError | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            return _run_engine_once(
-                argv, prompt, timeout, cwd, engine,
-            )
-        except FGError as exc:
-            last_error = exc
-            if "CLI not found" in str(exc):
-                raise  # not transient
-            if _is_quota_error(str(exc)) and _rotate_key():
-                sys.stderr.write(
-                    f"[sapper] quota/auth error (attempt {attempt}/{attempts}); "
-                    "key rotated — retrying immediately\n"
-                )
-                continue
-            if attempt < attempts:
-                backoff = min(120, 10 * (2 ** (attempt - 1)))
-                sys.stderr.write(
-                    f"[sapper] engine call failed (attempt {attempt}/{attempts}): "
-                    f"{exc}; retrying in {backoff}s\n"
-                )
-                time.sleep(backoff)
-    assert last_error is not None
-    raise last_error
+    """Compatibility alias for older Sapper command handlers."""
+    return run_engine(
+        prompt,
+        model=model,
+        timeout=timeout,
+        skip_permissions=skip_permissions,
+        append_system=append_system,
+        cwd=cwd,
+    )
 
 
 def _run_engine_once(argv, prompt, timeout, cwd, engine) -> dict:
@@ -2423,7 +2424,7 @@ def cmd_command(args) -> int:
                 "board": render_board(rows),
                 "time_budget": format_time_budget(deadline),
             })
-            envelope = run_claude(
+            envelope = run_engine(
                 prompt, model=model, timeout=timeout, skip_permissions=False,
                 append_system=None, cwd=Path.cwd(),
             )
@@ -2934,7 +2935,7 @@ def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> i
     if args.dry_run:
         print(prompt)
         return 0
-    envelope = run_claude(
+    envelope = run_engine(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -2981,7 +2982,7 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
         return 0
     if args.claim:
         store.claim_intent(intent["id"], worker)
-    envelope = run_claude(
+    envelope = run_engine(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
         append_system=_agents_system_prompt(store), cwd=cwd,
@@ -3013,7 +3014,7 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
     if args.dry_run:
         print(prompt)
         return 0
-    envelope = run_claude(
+    envelope = run_engine(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
     )
@@ -3033,7 +3034,7 @@ def _dispatch_blindspot(store, templates_dir, model, timeout, skip, cwd, args) -
     if args.dry_run:
         print(prompt)
         return 0
-    envelope = run_claude(
+    envelope = run_engine(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -3092,7 +3093,7 @@ def _dispatch_brainstorm(store, templates_dir, model, timeout, skip, cwd, args) 
     if args.dry_run:
         print(prompt)
         return 0
-    envelope = run_claude(
+    envelope = run_engine(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -3878,7 +3879,7 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd, time_budget
     """Like _dispatch_reason but returns (kind, summary) instead of printing."""
     tpl = _load_template(templates_dir, "reason.md")
     prompt = render_prompt(store, tpl, time_budget=time_budget)
-    envelope = run_claude(
+    envelope = run_engine(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
     )
@@ -3900,7 +3901,7 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
     prompt = render_intent_prompt(store, tpl, intent)
     if claim:
         store.claim_intent(intent["id"], worker)
-    envelope = run_claude(
+    envelope = run_engine(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=_agents_system_prompt(store), cwd=cwd,
     )
@@ -3920,7 +3921,7 @@ def _run_verify_raw(store, templates_dir, intent, model, timeout, skip, cwd) -> 
         "intent_description": _scrub_inline(intent["description"]),
         "result_description": _scrub_inline(fact["description"]),
     })
-    envelope = run_claude(
+    envelope = run_engine(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
     )
