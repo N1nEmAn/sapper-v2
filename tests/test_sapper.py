@@ -163,7 +163,7 @@ class GraphIntegrityTests(unittest.TestCase):
         })()
         with mock.patch.object(
             sapper,
-            "run_claude",
+            "run_engine",
             return_value={"result": '{"accepted": true, "data": {"verified": false, "issues": "mismatch"}}'},
         ):
             rc = sapper._dispatch_verify(

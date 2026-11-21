@@ -1,0 +1,8 @@
+{"type":"session.created","timestamp":1,"sessionID":"ses_main"}
+{"type":"session.reasoning.delta","timestamp":2,"sessionID":"ses_main","data":{"delta":"hidden reasoning must be ignored"}}
+{"type":"session.text.delta","timestamp":3,"sessionID":"ses_main","data":{"assistantMessageID":"msg_1","delta":"partial text that must not be duplicated"}}
+{"type":"session.text.ended","timestamp":4,"sessionID":"ses_main","data":{"assistantMessageID":"msg_1","text":"final answer"}}
+{"type":"session.text.delta","timestamp":5,"sessionID":"ses_main","data":{"assistantMessageID":"msg_2","delta":"fallback only"}}
+{"type":"session.idle","timestamp":6,"sessionID":"ses_main"}
+{"type":"session.created","timestamp":7,"sessionID":"ses_child"}
+{"type":"session.text.ended","timestamp":8,"sessionID":"ses_child","data":{"assistantMessageID":"msg_child","text":"child noise must be ignored"}}
